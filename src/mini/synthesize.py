@@ -542,6 +542,7 @@ async def _monitor_resources(
     *,
     artifacts_root: Path,
     disk_state: dict[str, Any],
+    disk_stop: asyncio.Event,
 ) -> None:
     warned = False
     stopped = False
@@ -575,6 +576,10 @@ async def _monitor_resources(
                 disk_state["level"] = "stop"
                 if not stopped:
                     stopped = True
+                    # Plan §15: below the stop threshold no new trajectory may
+                    # start; in-flight attempts finish and the run ends
+                    # interruptible-resumable.
+                    disk_stop.set()
                     _event(
                         paths,
                         manifest.run_id,
@@ -788,6 +793,7 @@ async def synthesize(
                 monitor_interval,
                 artifacts_root=config.artifact_root,
                 disk_state=disk_state,
+                disk_stop=disk_stop,
             )
         )
         queue: asyncio.Queue[int | None] = asyncio.Queue(maxsize=max(2, workers * 2))

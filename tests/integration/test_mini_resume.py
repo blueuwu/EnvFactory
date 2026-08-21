@@ -13,9 +13,13 @@ from src.mini.build_graph import GraphBuildResult
 from src.mini.catalog import CatalogReport, CatalogServer
 from src.mini.config import load_config
 from src.mini.synthesize import (
+    DISK_STOP_BYTES,
+    DISK_WARN_BYTES,
+    PILOT_MIN_ATTEMPTS,
     SynthesisPreflight,
     SynthesisError,
     config_compatibility_hash,
+    make_run_id,
     synthesize,
 )
 
@@ -71,6 +75,13 @@ class FakeGenerator:
             )
         ]
         return chain
+
+
+class AlwaysFailingGenerator(FakeGenerator):
+    """Every attempt fails transiently, so each seed burns all its attempts."""
+
+    async def gen(self, chain: ToolQueryChain) -> ToolQueryChain:
+        raise TimeoutError("transport timeout while serving")
 
 
 class TransientOnceGenerator(FakeGenerator):
@@ -288,3 +299,159 @@ def test_resume_refuses_semantic_configuration_change(tmp_path) -> None:
                 initialize_mcp=False,
             )
         )
+
+
+def _events(config, run_id: str) -> list[dict]:
+    path = config.artifact_root / "runs" / run_id / "logs" / "events.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_pilot_circuit_breaker_fails_run_above_server_failure_rate(tmp_path) -> None:
+    config, preflight = _fixture(tmp_path)
+    # One server, two attempts per seed: 20 failed attempts trip the 20%
+    # breaker exactly at PILOT_MIN_ATTEMPTS with a 100% Tiny failure rate.
+    with pytest.raises(SynthesisError, match="circuit breaker"):
+        asyncio.run(
+            synthesize(
+                config,
+                target=30,
+                workers=1,
+                run_id="breaker-test",
+                preflight=preflight,
+                generator_factory=lambda _: AlwaysFailingGenerator(),
+                initialize_mcp=False,
+                monitor_interval=0.01,
+            )
+        )
+
+    manifest = json.loads(
+        (config.artifact_root / "runs" / "breaker-test" / "run_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["state"] == "failed"
+    assert manifest["completed_seeds"] == []
+    # The breaker fires on the exact PILOT_MIN_ATTEMPTS-th failed attempt:
+    # ten seeds burning two transient attempts each.
+    assert sum(manifest["attempts_by_seed"].values()) == PILOT_MIN_ATTEMPTS
+    completed_dir = (
+        config.artifact_root / "runs" / "breaker-test" / "trajectories" / "completed"
+    )
+    assert list(completed_dir.glob("*.json")) == []
+    failures = [
+        record
+        for record in _events(config, "breaker-test")
+        if record["operation"] == "trajectory_failed" or record.get("outcome") == "failed_attempt"
+    ]
+    assert failures, "failure events must be recorded before the breaker fires"
+    states = [record for record in _events(config, "breaker-test") if record["operation"] == "run_state"]
+    assert states[-1]["outcome"] == "failed"
+    assert states[-1]["exception_class"] == "SynthesisError"
+
+
+def test_disk_pressure_stops_new_trajectories_and_warns_below_thresholds(
+    tmp_path, monkeypatch
+) -> None:
+    import shutil as shutil_module
+
+    config, preflight = _fixture(tmp_path)
+
+    class FakeUsage:
+        def __init__(self, free: int):
+            self.free = free
+
+    # Stop level: below DISK_STOP_BYTES the producer halts and the run ends
+    # interrupted without reaching the target.
+    monkeypatch.setattr(
+        shutil_module, "disk_usage", lambda _root: FakeUsage(DISK_STOP_BYTES - 1024)
+    )
+    manifest = asyncio.run(
+        synthesize(
+            config,
+            target=10,
+            workers=1,
+            run_id="disk-stop-test",
+            preflight=preflight,
+            generator_factory=lambda _: FakeGenerator(),
+            initialize_mcp=False,
+            monitor_interval=0.01,
+        )
+    )
+    assert manifest.state == "interrupted"
+    assert len(manifest.completed_seeds) < 10
+    stop_events = [
+        record
+        for record in _events(config, "disk-stop-test")
+        if record["operation"] == "disk_pressure"
+        and record["outcome"] == "stopping_new_trajectories"
+    ]
+    assert stop_events and stop_events[0]["free_bytes"] < DISK_STOP_BYTES
+
+    # Warn level: between thresholds generation continues but a warning is
+    # recorded exactly once.
+    monkeypatch.setattr(
+        shutil_module,
+        "disk_usage",
+        lambda _root: FakeUsage((DISK_STOP_BYTES + DISK_WARN_BYTES) // 2),
+    )
+    manifest = asyncio.run(
+        synthesize(
+            config,
+            target=2,
+            workers=1,
+            run_id="disk-warn-test",
+            preflight=preflight,
+            generator_factory=lambda _: FakeGenerator(),
+            initialize_mcp=False,
+            monitor_interval=0.01,
+        )
+    )
+    assert manifest.state == "completed"
+    warnings = [
+        record
+        for record in _events(config, "disk-warn-test")
+        if record["operation"] == "disk_pressure" and record["outcome"] == "warning"
+    ]
+    assert len(warnings) == 1
+
+
+def test_new_run_suffixes_past_existing_manifest_instead_of_refusing(
+    tmp_path, monkeypatch
+) -> None:
+    config, preflight = _fixture(tmp_path)
+    base = make_run_id(config, preflight.config_sha256)
+    # Simulate an existing run occupying the natural next ID.
+    occupied = config.artifact_root / "runs" / base / "run_manifest.json"
+    occupied.parent.mkdir(parents=True, exist_ok=True)
+    occupied.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(SynthesisError, match="run already exists; use --resume"):
+        asyncio.run(
+            synthesize(
+                config,
+                target=1,
+                workers=1,
+                run_id=base,
+                preflight=preflight,
+                generator_factory=lambda _: FakeGenerator(),
+                initialize_mcp=False,
+                monitor_interval=0.01,
+            )
+        )
+
+    manifest = asyncio.run(
+        synthesize(
+            config,
+            target=1,
+            workers=1,
+            new_run=True,
+            preflight=preflight,
+            generator_factory=lambda _: FakeGenerator(),
+            initialize_mcp=False,
+            monitor_interval=0.01,
+        )
+    )
+    assert manifest.state == "completed"
+    assert manifest.run_id == f"{base}-2"
+    assert occupied.read_text(encoding="utf-8") == "{}", "existing run must stay untouched"
+    assert (config.artifact_root / "runs" / manifest.run_id / "trajectories" / "completed").is_dir()
