@@ -175,3 +175,56 @@ def test_graph_manifest_and_warm_build_use_no_live_computation(tmp_path) -> None
     )
     assert warm.cached is True
     assert warm.manifest["output_sha256"] == result.manifest["output_sha256"]
+
+
+def test_main_records_graph_stage_events(tmp_path, monkeypatch) -> None:
+    """The CLI writes start/completed/failed stage events (plan §17)."""
+    from types import SimpleNamespace
+
+    import src.mini.build_graph as build_graph_module
+    from src.mini.config import MiniConfigError
+
+    monkeypatch.setenv("ENVFACTORY_MINI_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    def fake_build(config, force=False):
+        return SimpleNamespace(
+            manifest={
+                "counts": {"tools": 2, "parameters": 3, "edges": 1},
+                "output_sha256": "fixture-graph-sha",
+            },
+            cached=True,
+        )
+
+    monkeypatch.setattr(build_graph_module, "build_graph", fake_build)
+    exit_code = build_graph_module.main(["--config", str(CONFIG_PATH)])
+    assert exit_code == 0
+    events_path = tmp_path / "artifacts" / "graph" / "events.jsonl"
+    records = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [record["event"] for record in records] == ["start", "completed"]
+    assert all(record["stage"] == "graph" for record in records)
+    assert isinstance(records[-1]["duration_ms"], int)
+    assert records[-1]["cached"] is True
+    assert records[-1]["output_sha256"] == "fixture-graph-sha"
+
+    def failing_build(config, force=False):
+        raise MiniConfigError("injected configuration failure")
+
+    monkeypatch.setenv(
+        "ENVFACTORY_MINI_ARTIFACT_ROOT", str(tmp_path / "artifacts-failed")
+    )
+    monkeypatch.setattr(build_graph_module, "build_graph", failing_build)
+    exit_code = build_graph_module.main(["--config", str(CONFIG_PATH)])
+    assert exit_code == 1
+    failed_records = [
+        json.loads(line)
+        for line in (tmp_path / "artifacts-failed" / "graph" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line
+    ]
+    assert [record["event"] for record in failed_records] == ["start", "failed"]
+    assert failed_records[-1]["exception_class"] == "MiniConfigError"
