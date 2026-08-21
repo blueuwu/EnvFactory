@@ -197,3 +197,9 @@ Stub artifacts were deleted after the smoke; no generated artifact is tracked.
 
 Remaining risk: the live MoLab sweeps are still unexecuted, so no serving
 default has changed.
+
+Addendum correction (2026-08-21): regression coverage written for the
+conformance features found that disk-pressure stop-level was logged but never
+enforced - `disk_stop` was checked in three places and set nowhere, so runs
+continued below the 10 GiB threshold. The monitor now sets the event; focused
+tests cover the breaker, warn/stop thresholds, and `--new-run` suffixing.
