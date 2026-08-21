@@ -351,6 +351,10 @@ the resume source of truth. Failures retain every attempt in
 failures below the configured attempt limit are retried. If a dead process
 leaves `.synthesis.lock`, inspect it first and then explicitly add
 `--recover-stale-lock`. Never use that flag while the recorded PID is live.
+When compatibility or existing-run refusals block a deliberate restart, add
+`--new-run` to start a fresh suffixed run directory (plan §9 rule 6) instead of
+mutating or resuming the old one; without it, re-using an occupied run ID
+fails with `run already exists; use --resume`.
 
 Run the local fault-injection regressions with:
 
