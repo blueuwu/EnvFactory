@@ -1,7 +1,9 @@
 """Reproducible resource benchmarks for MoLab mini hardening work.
 
-The supported benchmarks measure fixed-catalog MCP registration and identical-
-seed generation worker sweeps.  Resulting JSON contains no prompts, scenario
+The supported benchmarks measure fixed-catalog MCP registration,
+identical-seed generation worker sweeps, and live server configurations
+replaying real completed-trajectory prompts (serving context, max_num_seqs,
+and GPU-utilization tuning).  Resulting JSON contains no prompts, scenario
 data, environment variables, or command-line secrets.
 """
 
