@@ -394,9 +394,12 @@ def test_serving_comparison_renders_deltas_and_rejects_stage_mismatch():
 
     before = report("ctx8k", 1.0, 2.0, 8192)
     after = report("ctx16k", 0.8, 1.6, 16384)
+    before["summary"]["error_kinds"] = {"HTTPError": 2}
+    after["summary"]["error_kinds"] = {}
     rendered = render_serving_comparison_markdown(before, after)
     assert "| Label | ctx8k | ctx16k |" in rendered
     assert "| Configured context | 8192 | 16384 |" in rendered
+    assert "| Error kinds | {'HTTPError': 2} | {} |" in rendered
     assert "| Latency p50 (s) | 1.0000 | 0.8000 |" in rendered
     assert "-0.2000 seconds (-20.0%)" in rendered
     with pytest.raises(BenchmarkError, match="same stage"):
@@ -427,6 +430,7 @@ def test_serving_comparison_tolerates_fully_failed_report():
                 "failed_requests": 20,
                 "prompt_tokens_total": 0,
                 "completion_tokens_total": 0,
+                "error_kinds": {"HTTPError": 20},
             },
         }
 
