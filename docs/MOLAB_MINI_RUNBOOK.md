@@ -923,10 +923,14 @@ record prompt lengths and hashes, never prompt text:
 Latency starts before client-side queueing, so p50/p95 under
 `--concurrency 2..8` reflects what server-side `max_num_seqs` tuning changes;
 concurrency stays within a client bound of eight and is recorded in the report.
-Over-context request failures at 8K (HTTP 400/500) are retained as measurement
-data with sanitized messages, not hidden: they bound the usable real-prompt
-distribution at each context length. Track OOMs through the same error records
-plus NVML peaks in the raw JSON. Retain every raw JSON report before changing
+Each report records the source run and a prompt-pool sha256 (also shown in the
+Markdown) for archive traceability. Over-context request failures at 8K
+(HTTP 400/500) are retained as measurement data with sanitized messages, not
+hidden: they bound the usable real-prompt distribution at each context length.
+Track OOMs through the same error records plus NVML peaks in the raw JSON.
+`compare` warns when the two sides replayed different prompt pools or source
+runs: such a latency comparison is not like-for-like (plan §14) and must not
+justify changing any default. Retain every raw JSON report before changing
 any serving default.
 
 ### Student 4B versus 8B throughput and quality comparison
