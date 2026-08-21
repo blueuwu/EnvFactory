@@ -203,3 +203,10 @@ conformance features found that disk-pressure stop-level was logged but never
 enforced - `disk_stop` was checked in three places and set nowhere, so runs
 continued below the 10 GiB threshold. The monitor now sets the event; focused
 tests cover the breaker, warn/stop thresholds, and `--new-run` suffixing.
+
+Addendum correction 2 (2026-08-21): the --new-run suffixing regression was
+time-dependent - it computed the occupied run ID from make_run_id at fixture
+setup, so a call landing in a later wall-clock second skipped the collision
+and failed intermittently. The test now pins make_run_id via monkeypatch;
+verified stable across second boundaries (5/5) and in the full integration
+suite (24 passed).

@@ -19,7 +19,6 @@ from src.mini.synthesize import (
     SynthesisPreflight,
     SynthesisError,
     config_compatibility_hash,
-    make_run_id,
     synthesize,
 )
 
@@ -418,8 +417,17 @@ def test_disk_pressure_stops_new_trajectories_and_warns_below_thresholds(
 def test_new_run_suffixes_past_existing_manifest_instead_of_refusing(
     tmp_path, monkeypatch
 ) -> None:
+    import src.mini.synthesize as synthesize_module
+
     config, preflight = _fixture(tmp_path)
-    base = make_run_id(config, preflight.config_sha256)
+    # Pin the generated ID so the collision is deterministic regardless of
+    # which wall-clock second each call lands in.
+    base = "20260101T000000Z-0123456789ab-f1x2e3d4"
+    monkeypatch.setattr(
+        synthesize_module,
+        "make_run_id",
+        lambda _config, _sha: base,
+    )
     # Simulate an existing run occupying the natural next ID.
     occupied = config.artifact_root / "runs" / base / "run_manifest.json"
     occupied.parent.mkdir(parents=True, exist_ok=True)
