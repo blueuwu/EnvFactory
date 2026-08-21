@@ -631,6 +631,9 @@ def benchmark_serving_context(
 
     pool = _load_completed_prompts(config, run_id)
     selected, positions = _select_prompt_percentiles(pool, requests)
+    pool_hash = hashlib.sha256(
+        json.dumps(sorted(pool), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     post = _post_chat or _serving_poster(
         config, max_tokens=max_tokens, seed=config.run_seed, timeout=timeout
     )
@@ -690,6 +693,7 @@ def benchmark_serving_context(
         },
         "inputs": {
             "source_run_id": run_id,
+            "prompt_pool_sha256": pool_hash,
             "prompt_pool_size": len(pool),
             "requests": requests,
             "concurrency": concurrency,
@@ -795,8 +799,25 @@ def render_serving_comparison_markdown(before: dict[str, Any], after: dict[str, 
         summary_row("Completion tokens total", "completion_tokens_total"),
         "",
         f"Median-latency change: **{delta_line}**.",
-        "",
     ]
+    before_pool = before["inputs"].get("prompt_pool_sha256")
+    after_pool = after["inputs"].get("prompt_pool_sha256")
+    same_source = (
+        before["inputs"].get("source_run_id") == after["inputs"].get("source_run_id")
+        and before_pool is not None
+        and before_pool == after_pool
+    )
+    if not same_source:
+        lines.extend(
+            [
+                "**Warning:** the two reports replayed different prompt pools or"
+                " source runs; per plan §14 such a latency comparison is not a",
+                "valid like-for-like measurement. Re-run both sides against the",
+                "same completed run before changing any default.",
+                "",
+            ]
+        )
+    lines.append("")
     return "\n".join(lines)
 
 

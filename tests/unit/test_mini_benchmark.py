@@ -381,7 +381,8 @@ def test_serving_comparison_renders_deltas_and_rejects_stage_mismatch():
                 "configured_max_num_seqs": 4,
                 "configured_gpu_memory_utilization": 0.85,
             },
-            "inputs": {"source_run_id": "r", "requests": 20, "concurrency": 1},
+            "inputs": {"source_run_id": "r", "requests": 20, "concurrency": 1,
+                       "prompt_pool_sha256": "pool-same-source"},
             "summary": {
                 "latency_seconds_p50": p50,
                 "latency_seconds_p95": p95,
@@ -402,8 +403,18 @@ def test_serving_comparison_renders_deltas_and_rejects_stage_mismatch():
     assert "| Error kinds | {'HTTPError': 2} | {} |" in rendered
     assert "| Latency p50 (s) | 1.0000 | 0.8000 |" in rendered
     assert "-0.2000 seconds (-20.0%)" in rendered
+    assert "**Warning:**" not in rendered
     with pytest.raises(BenchmarkError, match="same stage"):
         render_serving_comparison_markdown(before, {"stage": "other"})
+
+    # Same labels but a different prompt pool: the comparison must flag that
+    # the sides are not like-for-like (plan §14).
+    after_mismatch = report("ctx16k", 0.8, 1.6, 16384)
+    after_mismatch["inputs"]["prompt_pool_sha256"] = "pool-other"
+    after_mismatch["summary"]["error_kinds"] = {}
+    warned = render_serving_comparison_markdown(before, after_mismatch)
+    assert "**Warning:** the two reports replayed different prompt pools" in warned
+    assert "Re-run both sides against the" in warned
 
 
 def test_serving_comparison_tolerates_fully_failed_report():
