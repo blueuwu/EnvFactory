@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import importlib.metadata
 import json
 import os
@@ -182,8 +181,12 @@ def _process_is_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except OSError as exc:
-        return exc.errno == errno.EPERM
+    except PermissionError:
+        # Access denied (EPERM/EACCES) still proves the process exists;
+        # protected processes such as Windows system PIDs surface errno 13.
+        return True
+    except OSError:
+        return False
     return True
 
 
@@ -213,8 +216,33 @@ class RunLock:
                     raise RunLockError(
                         "run lock appears stale; inspect it and pass --recover-stale-lock to replace it"
                     )
+                stolen = self.path.with_name(f"{self.path.name}.{self.lock_id}.stolen")
                 try:
-                    self.path.unlink()
+                    # Atomic steal: after the rename we hold the only link to
+                    # the stale lock, so a concurrent acquirer can never see us
+                    # delete a lock that was replaced with a fresh one.
+                    os.replace(self.path, stolen)
+                except FileNotFoundError:
+                    # Another process reclaimed or removed it; re-evaluate.
+                    self.recover_stale = False
+                    continue
+                try:
+                    stolen_record = json.loads(stolen.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    stolen_record = None
+                stolen_pid = -1
+                if isinstance(stolen_record, dict):
+                    try:
+                        stolen_pid = int(stolen_record.get("pid", -1))
+                    except (TypeError, ValueError):
+                        stolen_pid = -1
+                if _process_is_alive(stolen_pid):
+                    # The judgement read raced against a fresh writer: put its
+                    # lock back exactly as we found it and refuse.
+                    os.replace(stolen, self.path)
+                    raise RunLockError(f"run is already locked by live PID {stolen_pid}")
+                try:
+                    stolen.unlink()
                 except FileNotFoundError:
                     pass
                 self.recover_stale = False

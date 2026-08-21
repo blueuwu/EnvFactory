@@ -14,6 +14,7 @@ ASYNC_MCP_CALLERS = (
     ROOT / "src" / "gen" / "query_gen" / "query_gen_non_conv.py",
     ROOT / "src" / "gen" / "query_gen" / "query_gen_conv.py",
     ROOT / "src" / "gen" / "env_gen" / "validate_revise.py",
+    ROOT / "src" / "gen" / "env_gen" / "env_gen.py",
     ROOT / "src" / "utils" / "agent_tools.py",
 )
 SYNC_MANAGER_METHODS = {
@@ -21,6 +22,7 @@ SYNC_MANAGER_METHODS = {
     "close_client",
     "get_client",
     "load_scenario",
+    "register_mcp_server",
     "save_all_scenario",
     "save_all_scenarios",
 }

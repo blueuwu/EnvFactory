@@ -185,7 +185,9 @@ class EnvGen(Gen):
 
             client_manager = MCPClientManager()
             try:
-                client_manager.register_mcp_server(
+                # Awaited so registration never blocks this event loop; the
+                # sync variant parks the caller's loop on a future.result().
+                await client_manager.register_mcp_server_async(
                     server_name=metadata_info['class_name'],
                     tool_path=normalize_path(tool_path),
                     is_stateless=False
@@ -598,7 +600,9 @@ class EnvGen(Gen):
 
             client_manager = MCPClientManager()
             try:
-                client_manager.register_mcp_server(
+                # Awaited so registration never blocks this event loop; the
+                # sync variant parks the caller's loop on a future.result().
+                await client_manager.register_mcp_server_async(
                     server_name=result.class_name,
                     tool_path=tool_path_str,
                     is_stateless=False

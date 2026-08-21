@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -523,9 +524,27 @@ def _default_generator_factory(
     return factory
 
 
+# Plan §15 disk pressure: warn below 20 GiB free on the artifacts volume and
+# stop starting new trajectories below 10 GiB free.
+DISK_WARN_BYTES = 20 * 1024**3
+DISK_STOP_BYTES = 10 * 1024**3
+# Plan §15 MCP process failure: fail the run when one server exceeds a 20%
+# failure rate during the pilot window.
+PILOT_MIN_ATTEMPTS = 20
+PILOT_BREAKER_THRESHOLD = 0.2
+
+
 async def _monitor_resources(
-    manifest: RunManifest, paths: RunPaths, stop: asyncio.Event, interval: float
+    manifest: RunManifest,
+    paths: RunPaths,
+    stop: asyncio.Event,
+    interval: float,
+    *,
+    artifacts_root: Path,
+    disk_state: dict[str, Any],
 ) -> None:
+    warned = False
+    stopped = False
     while not stop.is_set():
         try:
             import psutil
@@ -550,6 +569,35 @@ async def _monitor_resources(
         except Exception:
             pass
         try:
+            free = shutil.disk_usage(artifacts_root).free
+            disk_state["free_bytes"] = free
+            if free < DISK_STOP_BYTES:
+                disk_state["level"] = "stop"
+                if not stopped:
+                    stopped = True
+                    _event(
+                        paths,
+                        manifest.run_id,
+                        "disk_pressure",
+                        "stopping_new_trajectories",
+                        free_bytes=free,
+                    )
+            elif free < DISK_WARN_BYTES:
+                disk_state["level"] = "warn"
+                if not warned:
+                    warned = True
+                    _event(
+                        paths,
+                        manifest.run_id,
+                        "disk_pressure",
+                        "warning",
+                        free_bytes=free,
+                    )
+            else:
+                disk_state["level"] = "clear"
+        except OSError:
+            pass
+        try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
             continue
@@ -572,6 +620,7 @@ async def synthesize(
     workers: int,
     run_id: str | None = None,
     resume: bool = False,
+    new_run: bool = False,
     recover_stale_lock: bool = False,
     preflight: SynthesisPreflight | None = None,
     generator_factory: Callable[[int], Any] | None = None,
@@ -610,6 +659,17 @@ async def synthesize(
     if not _RUN_ID.fullmatch(run_id):
         raise SynthesisError("run ID contains unsafe characters")
     paths = RunPaths.for_run(config, run_id)
+    if new_run:
+        # Plan §9 rule 6: --new-run overrides compatibility refusals by
+        # starting a fresh run directory instead of mutating the old one.
+        base = make_run_id(config, preflight.config_sha256)
+        run_id = base
+        suffix = 2
+        while RunPaths.for_run(config, run_id).manifest.exists():
+            run_id = f"{base}-{suffix}"
+            suffix += 1
+        paths = RunPaths.for_run(config, run_id)
+        resume = False
     allowed_tools = _catalog_tool_names(preflight.catalog)
     graph_sha = preflight.graph_result.manifest.get("output_sha256")
     if not isinstance(graph_sha, str):
@@ -718,15 +778,54 @@ async def synthesize(
         )
         stop = stop_event or asyncio.Event()
         monitor_stop = asyncio.Event()
+        disk_state: dict[str, Any] = {"level": "clear", "free_bytes": None}
+        disk_stop = asyncio.Event()
         monitor = asyncio.create_task(
-            _monitor_resources(manifest, paths, monitor_stop, monitor_interval)
+            _monitor_resources(
+                manifest,
+                paths,
+                monitor_stop,
+                monitor_interval,
+                artifacts_root=config.artifact_root,
+                disk_state=disk_state,
+            )
         )
         queue: asyncio.Queue[int | None] = asyncio.Queue(maxsize=max(2, workers * 2))
         progress_lock = asyncio.Lock()
+        pilot_attempts: dict[str, int] = {}
+        pilot_failures: dict[str, int] = {}
+        pilot_seen = {"attempts": 0}
+        pilot_breach: list[str] = []
+
+        def _pilot_note(servers: list[str], *, failed: bool) -> None:
+            """Attribute one trajectory attempt to its servers during the
+            pilot window; abort the run when a server's failure rate exceeds
+            PILOT_BREAKER_THRESHOLD (plan §15, MCP process failure)."""
+            if pilot_breach or pilot_seen["attempts"] >= PILOT_MIN_ATTEMPTS:
+                return
+            pilot_seen["attempts"] += 1
+            for name in servers:
+                pilot_attempts[name] = pilot_attempts.get(name, 0) + 1
+                if failed:
+                    pilot_failures[name] = pilot_failures.get(name, 0) + 1
+            if pilot_seen["attempts"] == PILOT_MIN_ATTEMPTS:
+                breached = sorted(
+                    name
+                    for name, attempts in pilot_attempts.items()
+                    if attempts
+                    and pilot_failures.get(name, 0) / attempts > PILOT_BREAKER_THRESHOLD
+                )
+                if breached:
+                    pilot_breach.extend(breached)
+                    raise SynthesisError(
+                        "pilot circuit breaker: per-server failure rate above "
+                        f"{PILOT_BREAKER_THRESHOLD:.0%} in the "
+                        f"{PILOT_MIN_ATTEMPTS}-attempt pilot for: {', '.join(breached)}"
+                    )
 
         async def producer() -> None:
             for seed in list(manifest.pending_seeds):
-                if stop.is_set():
+                if stop.is_set() or disk_stop.is_set():
                     break
                 sample_path = paths.sampled_chains / f"{seed}.json"
                 if not sample_path.exists():
@@ -764,9 +863,18 @@ async def synthesize(
                 try:
                     if seed is None:
                         return
-                    if stop.is_set():
+                    if stop.is_set() or disk_stop.is_set():
                         continue
                     sample_path = paths.sampled_chains / f"{seed}.json"
+                    try:
+                        sample_servers = [
+                            str(name)
+                            for name in json.loads(
+                                sample_path.read_text(encoding="utf-8")
+                            ).get("servers", [])
+                        ]
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        sample_servers = []
                     start_attempt = manifest.attempts_by_seed.get(str(seed), 0) + 1
                     for attempt in range(
                         start_attempt, config.generation.max_attempts_per_seed + 1
@@ -819,6 +927,8 @@ async def synthesize(
                                 retryable=retryable,
                                 secret_values=secret_values,
                             )
+                            async with progress_lock:
+                                _pilot_note(sample_servers, failed=True)
                             if retryable:
                                 continue
                             if seed not in manifest.failed_seeds:
@@ -854,6 +964,7 @@ async def synthesize(
                                     f"(failed {len(manifest.failed_seeds)})",
                                     flush=True,
                                 )
+                                _pilot_note(sample_servers, failed=False)
                             break
                         finally:
                             if hasattr(generator, "reset_run_state"):
@@ -901,7 +1012,7 @@ async def synthesize(
                 return manifest
             raise fatal
 
-        if stop.is_set():
+        if stop.is_set() or disk_stop.is_set():
             manifest.state = "interrupted"
         elif len(manifest.completed_seeds) == target:
             manifest.state = "completed"
@@ -939,6 +1050,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace a verified non-live run lock",
     )
+    parser.add_argument(
+        "--new-run",
+        action="store_true",
+        help="Start a fresh run directory even when compatibility checks would refuse",
+    )
     return parser
 
 
@@ -954,6 +1070,7 @@ async def _async_main(args: argparse.Namespace) -> RunManifest:
         workers=workers,
         run_id=args.run_id,
         resume=args.resume,
+        new_run=args.new_run,
         recover_stale_lock=args.recover_stale_lock,
         stop_event=stop,
     )

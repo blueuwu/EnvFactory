@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -75,6 +77,29 @@ def test_live_and_stale_run_locks_require_explicit_recovery(tmp_path) -> None:
     with RunLock(path, recover_stale=True):
         assert path.exists()
     assert not path.exists()
+
+
+def test_stale_recovery_never_deletes_a_replaced_fresh_lock(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "run.lock"
+    live = json.dumps({"pid": os.getpid(), "lock_id": "live-one"})
+    path.write_text(live, encoding="utf-8")
+
+    real_read_text = Path.read_text
+    judged = {"done": False}
+
+    def forged_first_read(self, *args, **kwargs):
+        if self == path and not judged["done"]:
+            judged["done"] = True
+            # The first judgement read lies: the lock looks stale and dead.
+            return '{"pid": 2147483647}'
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", forged_first_read)
+    with pytest.raises(RunLockError, match="live PID"):
+        RunLock(path, recover_stale=True).acquire()
+
+    # The fresh writer's lock survived the recovery attempt byte-for-byte.
+    assert json.loads(real_read_text(path, encoding="utf-8"))["lock_id"] == "live-one"
 
 
 def test_seed_namespace_is_deterministic_ordered_and_unique() -> None:

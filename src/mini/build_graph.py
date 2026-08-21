@@ -94,6 +94,18 @@ def _teacher_descriptor(config: MiniConfig) -> TeacherUserProvidedClassifier:
     )
 
 
+def _recorded_path(path: Path, repo_root: Path) -> str:
+    """Repo-relative POSIX path, or the absolute POSIX path when outside it.
+
+    Catalog inputs may legitimately live outside the repository (for example
+    pytest fixtures on another drive), where ``relative_to`` raises ValueError.
+    """
+    try:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
 def _input_record(
     config: MiniConfig,
     catalog: CatalogReport,
@@ -105,7 +117,7 @@ def _input_record(
     files: list[dict[str, str]] = [
         {
             "kind": "mcp_config",
-            "path": config.catalog.mcp_config.relative_to(config.repo_root).as_posix(),
+            "path": _recorded_path(config.catalog.mcp_config, config.repo_root),
             "sha256": _sha256_file(config.catalog.mcp_config),
         }
     ]
@@ -115,13 +127,13 @@ def _input_record(
                 {
                     "kind": "metadata",
                     "server": server.name,
-                    "path": server.metadata_path.relative_to(config.repo_root).as_posix(),
+                    "path": _recorded_path(server.metadata_path, config.repo_root),
                     "sha256": _sha256_file(server.metadata_path),
                 },
                 {
                     "kind": "tool",
                     "server": server.name,
-                    "path": server.tool_path.relative_to(config.repo_root).as_posix(),
+                    "path": _recorded_path(server.tool_path, config.repo_root),
                     "sha256": _sha256_file(server.tool_path),
                 },
             ]
@@ -453,10 +465,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _append_stage_event(graph_dir: Path, payload: dict[str, Any]) -> None:
+    """Append one JSONL event to <graph_dir>/events.jsonl (plan §11/§17)."""
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    with (graph_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    started = time.perf_counter()
+    graph_dir: Path | None = None
+
+    def _event(event: str, **fields: Any) -> None:
+        if graph_dir is None:
+            return
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": "graph",
+            "event": event,
+        }
+        record.update(fields)
+        _append_stage_event(graph_dir, record)
+
     try:
         config = load_config(args.config, repo_root=args.repo_root)
+        graph_dir = config.graph.manifest_path.parent
+        _event("start")
         if args.dry_run:
             catalog, unmet = dry_run(config)
             dependency = ", ".join(unmet) if unmet else "none"
@@ -474,10 +509,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         MiniConfigError,
         ValueError,
     ) as exc:
+        _event(
+            "failed",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            exception_class=type(exc).__name__,
+        )
         print(f"graph build failed: {exc}", file=sys.stderr)
         return 1
     counts = result.manifest["counts"]
     state = "cache hit" if result.cached else "built"
+    _event(
+        "completed",
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        cached=result.cached,
+        output_sha256=result.manifest["output_sha256"],
+    )
     print(
         f"graph {state}: {counts['tools']} tools, {counts['parameters']} parameters, "
         f"{counts['edges']} edges, sha256={result.manifest['output_sha256']}"
