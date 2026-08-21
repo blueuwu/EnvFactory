@@ -344,6 +344,7 @@ def test_serving_context_concurrency_is_recorded_and_bounded(tmp_path, monkeypat
         {"requests": 0},
         {"max_tokens": 0},
         {"concurrency": 0},
+        {"timeout": 0},
     ],
 )
 def test_serving_context_rejects_invalid_measurement_inputs(tmp_path, kwargs):

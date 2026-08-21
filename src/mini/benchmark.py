@@ -609,6 +609,10 @@ def benchmark_serving_context(
     setting, restart vLLM, rerun, and compare the retained reports.  Requests
     use temperature 0, a recorded seed, and thinking disabled so latency
     differences come from the server configuration, not decoding variance.
+
+    Raises:
+        BenchmarkError: on invalid labels, non-positive measurement inputs,
+            concurrency outside 1..8, or a failed endpoint health check.
     """
     if not _BENCHMARK_LABEL.fullmatch(label):
         raise BenchmarkError(
@@ -620,6 +624,8 @@ def benchmark_serving_context(
         raise BenchmarkError("concurrency must remain within the mini client bound of 1..8")
     if max_tokens <= 0:
         raise BenchmarkError("max_tokens must be positive")
+    if timeout <= 0:
+        raise BenchmarkError("timeout must be positive")
 
     config = load_config(config_path, repo_root=repo_root)
     if _health is None:
