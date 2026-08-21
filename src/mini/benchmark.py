@@ -456,6 +456,344 @@ def benchmark_generation_workers(
     }
 
 
+def _load_completed_prompts(config: Any, run_id: str) -> list[str]:
+    """Collect real user prompts from one run's immutable completed trajectories.
+
+    The prompts never leave this function's caller in reports; only lengths and
+    hashes are recorded.  A malformed completed artifact is an error because
+    completed files are immutable and must reconcile cleanly.
+    """
+    from src.mini.synthesize import RunPaths
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        raise BenchmarkError("run ID contains unsafe characters")
+    completed = RunPaths.for_run(config, run_id).completed
+    if not completed.is_dir():
+        raise BenchmarkError(f"run {run_id} has no completed trajectory directory")
+    prompts: list[str] = []
+    for path in sorted(completed.glob("*.json"), key=lambda item: item.stem):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            nodes = payload["nodes"]
+            for node in nodes:
+                query = node.get("query")
+                if isinstance(query, str) and query.strip():
+                    prompts.append(query)
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            raise BenchmarkError(
+                f"completed artifact {path.name} is unreadable: {type(exc).__name__}"
+            ) from exc
+    if not prompts:
+        raise BenchmarkError(f"run {run_id} contains no real prompts to replay")
+    return prompts
+
+
+def _select_prompt_percentiles(pool: Sequence[str], count: int) -> tuple[list[str], list[float]]:
+    """Span the real prompt-length distribution deterministically.
+
+    Prompts are ordered by length and chosen at evenly spaced percentile
+    midpoints, so a sweep covers short and long real prompts without ever
+    storing their text.
+    """
+    ordered = sorted(pool, key=len)
+    selected: list[str] = []
+    positions: list[float] = []
+    for index in range(count):
+        position = (index + 0.5) / count
+        chosen = round(position * (len(ordered) - 1))
+        selected.append(ordered[chosen])
+        positions.append(round(position * 100, 1))
+    return selected, positions
+
+
+def _serving_poster(
+    config: Any, *, max_tokens: int, seed: int, timeout: float
+) -> Callable[[str], dict[str, Any]]:
+    """Build one recorded-settings chat-completion poster for the live endpoint."""
+    import urllib.request
+
+    api_key = os.environ.get(config.teacher.api_key_env)
+    if not api_key:
+        raise BenchmarkError(
+            f"required environment variable {config.teacher.api_key_env} is not present"
+        )
+    url = f"{config.teacher.base_url.rstrip('/')}/chat/completions"
+
+    def post(prompt: str) -> dict[str, Any]:
+        payload = {
+            "model": config.teacher.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "seed": seed,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise BenchmarkError("chat completion returned a non-object response")
+        return parsed
+
+    return post
+
+
+async def _run_serving_requests(
+    prompts: Sequence[str], *, post: Callable[[str], dict[str, Any]], concurrency: int
+) -> list[dict[str, Any]]:
+    """Replay prompts against the endpoint and record per-request evidence.
+
+    Latency starts before the concurrency semaphore so client-observed p50/p95
+    includes queue wait, which is exactly what server-side ``max_num_seqs``
+    tuning changes.  Every failure is recorded data, never a crash.
+    """
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def one(index: int, prompt: str) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "index": index,
+            "prompt_chars": len(prompt),
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16],
+        }
+        started = time.perf_counter()
+        try:
+            async with semaphore:
+                response = await asyncio.to_thread(post, prompt)
+        except Exception as exc:  # noqa: BLE001 - each failure is recorded evidence
+            record["latency_seconds"] = round(time.perf_counter() - started, 6)
+            record["error"] = type(exc).__name__
+            status = getattr(exc, "code", None)
+            if isinstance(status, int):
+                record["http_status"] = status
+            record["error_message"] = _safe_error_message(exc)
+            record["prompt_tokens"] = None
+            record["completion_tokens"] = None
+            return record
+        record["latency_seconds"] = round(time.perf_counter() - started, 6)
+        record["error"] = None
+        usage = response.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        record["prompt_tokens"] = prompt_tokens if isinstance(prompt_tokens, int) else None
+        record["completion_tokens"] = (
+            completion_tokens if isinstance(completion_tokens, int) else None
+        )
+        return record
+
+    return list(await asyncio.gather(*(one(index, prompt) for index, prompt in enumerate(prompts))))
+
+
+def benchmark_serving_context(
+    config_path: str | Path,
+    *,
+    label: str,
+    run_id: str,
+    requests: int = 20,
+    concurrency: int = 1,
+    max_tokens: int = 256,
+    timeout: float = 120.0,
+    repo_root: str | Path | None = None,
+    _health: Callable[[Any], dict[str, Any]] | None = None,
+    _post_chat: Callable[[str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Measure one live server configuration with real held-out prompts.
+
+    Context length, ``max_num_seqs``, and GPU utilization are server launch
+    settings, so one invocation measures exactly one configuration; change one
+    setting, restart vLLM, rerun, and compare the retained reports.  Requests
+    use temperature 0, a recorded seed, and thinking disabled so latency
+    differences come from the server configuration, not decoding variance.
+    """
+    if not _BENCHMARK_LABEL.fullmatch(label):
+        raise BenchmarkError(
+            "label must be 1-48 characters containing only letters, digits, dot, dash, or underscore"
+        )
+    if requests <= 0:
+        raise BenchmarkError("requests must be positive")
+    if not 1 <= concurrency <= 8:
+        raise BenchmarkError("concurrency must remain within the mini client bound of 1..8")
+    if max_tokens <= 0:
+        raise BenchmarkError("max_tokens must be positive")
+
+    config = load_config(config_path, repo_root=repo_root)
+    if _health is None:
+        from src.mini.doctor import check_model_health
+
+        health = check_model_health(config)
+    else:
+        health = _health(config)
+
+    pool = _load_completed_prompts(config, run_id)
+    selected, positions = _select_prompt_percentiles(pool, requests)
+    post = _post_chat or _serving_poster(
+        config, max_tokens=max_tokens, seed=config.run_seed, timeout=timeout
+    )
+
+    def sweep() -> list[dict[str, Any]]:
+        return asyncio.run(
+            _run_serving_requests(selected, post=post, concurrency=concurrency)
+        )
+
+    records, resources = measure_operation(sweep)
+    latencies = [record["latency_seconds"] for record in records if record["error"] is None]
+    prompt_tokens = [
+        record["prompt_tokens"] for record in records if record["prompt_tokens"] is not None
+    ]
+    completion_tokens = [
+        record["completion_tokens"]
+        for record in records
+        if record["completion_tokens"] is not None
+    ]
+    error_kinds: dict[str, int] = {}
+    for record in records:
+        if record["error"] is not None:
+            error_kinds[record["error"]] = error_kinds.get(record["error"], 0) + 1
+    summary = {
+        "complete": True,
+        "requests": len(records),
+        "successful_requests": len(latencies),
+        "failed_requests": len(records) - len(latencies),
+        "latency_seconds_p50": _percentile(latencies, 0.50),
+        "latency_seconds_p95": _percentile(latencies, 0.95),
+        "prompt_tokens_total": sum(prompt_tokens),
+        "prompt_tokens_p95": _percentile(prompt_tokens, 0.95),
+        "completion_tokens_total": sum(completion_tokens),
+        "error_kinds": dict(sorted(error_kinds.items())),
+        "wall_seconds": resources.wall_seconds,
+        "monotonic_seconds": resources.monotonic_seconds,
+    }
+    returned_model = health.get("returned_model")
+    return {
+        "schema_version": 1,
+        "stage": "serving_context",
+        "label": label,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "environment": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "logical_cpu_count": os.cpu_count(),
+        },
+        "server": {
+            "configured_model": config.teacher.model,
+            "served_model": returned_model if isinstance(returned_model, str) else config.teacher.model,
+            "base_url": health.get("base_url", config.teacher.base_url),
+            "reported_max_model_len": health.get("reported_max_model_len"),
+            "configured_max_model_len": config.teacher.max_model_len,
+            "configured_max_num_seqs": config.teacher.max_num_seqs,
+            "configured_gpu_memory_utilization": config.teacher.gpu_memory_utilization,
+        },
+        "inputs": {
+            "source_run_id": run_id,
+            "prompt_pool_size": len(pool),
+            "requests": requests,
+            "concurrency": concurrency,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "seed": config.run_seed,
+            "thinking_enabled": False,
+            "selected_prompt_percentiles": positions,
+            "selected_prompt_chars": [len(prompt) for prompt in selected],
+        },
+        "requests": records,
+        "resources": asdict(resources),
+        "summary": summary,
+    }
+
+
+def render_serving_context_markdown(report: dict[str, Any]) -> str:
+    """Render a compact decision table from one serving-context measurement."""
+    if report.get("stage") != "serving_context":
+        raise BenchmarkError("report is not a serving-context measurement")
+    server = report["server"]
+    inputs = report["inputs"]
+    summary = report["summary"]
+    p50 = summary["latency_seconds_p50"]
+    p95 = summary["latency_seconds_p95"]
+    rows = [
+        "# MoLab mini serving-context measurement",
+        "",
+        f"Label: `{report['label']}`",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Served model | {server['served_model']} |",
+        f"| Reported context | {server['reported_max_model_len']} |",
+        f"| Configured context | {server['configured_max_model_len']} |",
+        f"| Configured max_num_seqs | {server['configured_max_num_seqs']} |",
+        f"| Configured GPU utilization | {server['configured_gpu_memory_utilization']} |",
+        f"| Source run | {inputs['source_run_id']} |",
+        f"| Prompt pool size | {inputs['prompt_pool_size']} |",
+        f"| Requests x concurrency | {inputs['requests']} x {inputs['concurrency']} |",
+        f"| Max tokens / seed / thinking | {inputs['max_tokens']} / {inputs['seed']} / off |",
+        f"| Successful requests | {summary['successful_requests']} |",
+        f"| Failed requests | {summary['failed_requests']} |",
+        f"| Latency p50 (s) | {'n/a' if p50 is None else f'{p50:.4f}'} |",
+        f"| Latency p95 (s) | {'n/a' if p95 is None else f'{p95:.4f}'} |",
+        f"| Prompt tokens total | {summary['prompt_tokens_total']} |",
+        f"| Completion tokens total | {summary['completion_tokens_total']} |",
+        f"| Error kinds | {summary['error_kinds'] or 'none'} |",
+        "",
+        "Requests replay real completed-trajectory prompts at deterministic length",
+        "percentiles with temperature 0 and thinking disabled. Change one server",
+        "setting at a time, restart vLLM, rerun, and compare retained reports;",
+        "treat over-context errors at 8K as measurement data, not failures to hide.",
+        "",
+    ]
+    return "\n".join(rows)
+
+
+def render_serving_comparison_markdown(before: dict[str, Any], after: dict[str, Any]) -> str:
+    """Render a source-labelled comparison of two serving-context reports."""
+    if before.get("stage") != "serving_context" or after.get("stage") != "serving_context":
+        raise BenchmarkError("before and after reports must measure the same stage")
+
+    def row(metric: str, key: str, section: str = "server", fmt: str = "{}") -> str:
+        return f"| {metric} | {fmt.format(before[section][key])} | {fmt.format(after[section][key])} |"
+
+    def summary_row(metric: str, key: str, fmt: str = "{}") -> str:
+        return row(metric, key, section="summary", fmt=fmt)
+
+    def top_row(metric: str, key: str) -> str:
+        return f"| {metric} | {before[key]} | {after[key]} |"
+
+    before_p50 = before["summary"]["latency_seconds_p50"]
+    after_p50 = after["summary"]["latency_seconds_p50"]
+    delta_line = "n/a"
+    if before_p50 is not None and after_p50 is not None and before_p50:
+        percent = (after_p50 - before_p50) / before_p50 * 100.0
+        delta_line = f"{after_p50 - before_p50:+.4f} seconds ({percent:+.1f}%)"
+    lines = [
+        "# MoLab mini serving-context comparison",
+        "",
+        "| Metric | Before | After |",
+        "|---|---:|---:|",
+        top_row("Label", "label"),
+        row("Served model", "served_model"),
+        row("Reported context", "reported_max_model_len"),
+        row("Configured context", "configured_max_model_len"),
+        row("Configured max_num_seqs", "configured_max_num_seqs"),
+        row("Configured GPU utilization", "configured_gpu_memory_utilization"),
+        row("Source run", "source_run_id", section="inputs"),
+        row("Requests x concurrency", "requests", section="inputs"),
+        summary_row("Successful requests", "successful_requests"),
+        summary_row("Failed requests", "failed_requests"),
+        summary_row("Latency p50 (s)", "latency_seconds_p50", "{:.4f}"),
+        summary_row("Latency p95 (s)", "latency_seconds_p95", "{:.4f}"),
+        summary_row("Prompt tokens total", "prompt_tokens_total"),
+        summary_row("Completion tokens total", "completion_tokens_total"),
+        "",
+        f"Median-latency change: **{delta_line}**.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def render_generation_matrix_markdown(report: dict[str, Any]) -> str:
     """Render a compact decision table from a generation worker sweep."""
     if report.get("stage") != "generation_worker_matrix":
@@ -555,6 +893,17 @@ def _build_parser() -> argparse.ArgumentParser:
     generation.add_argument("--output", required=True)
     generation.add_argument("--markdown-output")
     generation.add_argument("--repo-root")
+    serving = subparsers.add_parser("serving-context")
+    serving.add_argument("--config", required=True)
+    serving.add_argument("--label", required=True)
+    serving.add_argument("--run-id", required=True)
+    serving.add_argument("--requests", type=int, default=20)
+    serving.add_argument("--concurrency", type=int, default=1)
+    serving.add_argument("--max-tokens", type=int, default=256)
+    serving.add_argument("--timeout", type=float, default=120.0)
+    serving.add_argument("--output", required=True)
+    serving.add_argument("--markdown-output")
+    serving.add_argument("--repo-root")
     compare = subparsers.add_parser("compare")
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
@@ -599,10 +948,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"generation matrix report={destination}")
             return 0 if report["summary"]["complete"] else 2
+        if args.command == "serving-context":
+            report = benchmark_serving_context(
+                args.config,
+                label=args.label,
+                run_id=args.run_id,
+                requests=args.requests,
+                concurrency=args.concurrency,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+                repo_root=args.repo_root,
+            )
+            destination = Path(args.output).expanduser().resolve()
+            atomic_write_json(destination, report)
+            if args.markdown_output:
+                markdown_destination = Path(args.markdown_output).expanduser().resolve()
+                atomic_write_text(
+                    markdown_destination, render_serving_context_markdown(report)
+                )
+                print(f"serving-context report={destination}; summary={markdown_destination}")
+            else:
+                print(f"serving-context report={destination}")
+            return 0
         before = json.loads(Path(args.before).read_text(encoding="utf-8"))
         after = json.loads(Path(args.after).read_text(encoding="utf-8"))
         destination = Path(args.output).expanduser().resolve()
-        atomic_write_text(destination, render_comparison_markdown(before, after))
+        if before.get("stage") == "serving_context":
+            rendered = render_serving_comparison_markdown(before, after)
+        else:
+            rendered = render_comparison_markdown(before, after)
+        atomic_write_text(destination, rendered)
         print(f"comparison={destination}")
         return 0
     except (BenchmarkError, MiniConfigError, OSError, RuntimeError, ValueError) as exc:
@@ -619,8 +994,11 @@ __all__ = [
     "ResourceMeasurement",
     "benchmark_catalog_registration",
     "benchmark_generation_workers",
+    "benchmark_serving_context",
     "main",
     "measure_operation",
     "render_comparison_markdown",
     "render_generation_matrix_markdown",
+    "render_serving_comparison_markdown",
+    "render_serving_context_markdown",
 ]
