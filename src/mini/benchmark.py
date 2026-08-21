@@ -732,6 +732,7 @@ def render_serving_context_markdown(report: dict[str, Any]) -> str:
         f"| Configured max_num_seqs | {server['configured_max_num_seqs']} |",
         f"| Configured GPU utilization | {server['configured_gpu_memory_utilization']} |",
         f"| Source run | {inputs['source_run_id']} |",
+        f"| Prompt pool sha256 | {inputs.get('prompt_pool_sha256', 'n/a')} |",
         f"| Prompt pool size | {inputs['prompt_pool_size']} |",
         f"| Requests x concurrency | {inputs['requests']} x {inputs['concurrency']} |",
         f"| Max tokens / seed / thinking | {inputs['max_tokens']} / {inputs['seed']} / off |",

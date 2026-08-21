@@ -272,6 +272,7 @@ def test_serving_context_replays_real_prompts_and_records_evidence(
     assert report["summary"]["latency_seconds_p50"] is not None
     rendered = render_serving_context_markdown(report)
     assert "| Reported context | 16384 |" in rendered
+    assert "| Prompt pool sha256 |" in rendered
     assert "| Latency p95 (s) |" in rendered
     for prompt in seen_prompts:
         assert prompt not in rendered
