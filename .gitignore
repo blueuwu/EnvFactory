@@ -39,7 +39,7 @@ secrets*.json
 *.pkl
 
 # Documentation (kept local for this fork)
-/docs/
+# /docs/
 
 # MoLab Mini local environments, artifacts, models, and caches
 /artifacts/

@@ -2,6 +2,8 @@
 
 # EnvFactory
 
+> Planning a single-GPU build? See the [agent-ready MoLab RTX PRO 6000 mini implementation plan](docs/MOLAB_MINI_IMPLEMENTATION_PLAN.md).
+
 **EnvFactory: Scaling Tool-Use Agents via Executable Environments Synthesis and Robust RL**
 
 <a href="https://github.com/LARK-AI-Lab/EnvFactory"><img src="https://img.shields.io/badge/GitHub-Repo-black?style=for-the-badge&logo=github" alt="GitHub"></a>
@@ -27,6 +29,20 @@
 | 📂 | Dataset | [EnvFactory-SFT-ALL](https://huggingface.co/datasets/LARK-Lab/EnvFactory-SFT-ALL) | Full SFT Data (53.4k) |
 
 </div>
+
+## MoLab Mini notebooks
+
+The single-GPU, resumable workflow is available as two marimo notebooks:
+
+- [`examples/molab_mini_generate.py`](examples/molab_mini_generate.py) for
+  environment checks, local teacher serving, graph construction, resumable
+  generation, dataset conversion, and export.
+- [`examples/molab_mini_train.py`](examples/molab_mini_train.py) for
+  GPU-exclusive LoRA training, resume/integrity checks, teacher/student
+  executable evaluation, and export.
+
+Follow [`docs/MOLAB_MINI_RUNBOOK.md`](docs/MOLAB_MINI_RUNBOOK.md) for every CLI
+equivalent and clean-session safety boundary.
 
 ---
 
