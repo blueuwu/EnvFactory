@@ -164,8 +164,9 @@ benchmark command, then extend to 6 and 8 only if the live doctor reports enough
 CPU capacity to revise the current four-worker safety contract. Retain the raw
 JSON and Markdown report before changing any generation or vLLM setting.
 
-The smoke suite was not run because this checkout has no `tests/smoke`
-directory and the required live teacher endpoint/GPU is absent.
+The smoke suite was not run for this handoff because the required live teacher
+endpoint/GPU is absent; the hermetic offline smoke spine in `tests/smoke/`
+existed untracked in this checkout and is now tracked and passing (1 test).
 
 ## Addendum (2026-08-21): serving-context benchmark instrument
 
