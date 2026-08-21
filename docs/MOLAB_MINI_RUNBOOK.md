@@ -348,8 +348,22 @@ catalog, model identity, and target may not change:
 leave the manifest in `interrupted` state. A completed file is immutable and is
 the resume source of truth. Failures retain every attempt in
 `trajectories/failed/<seed>.json`; only transient model/timeout/transport
-failures below the configured attempt limit are retried. If a dead process
-leaves `.synthesis.lock`, inspect it first and then explicitly add
+failures below the configured attempt limit are retried.
+
+Two runtime guards can also end a run early:
+
+- **Disk pressure** (plan §15): the resource monitor warns once when the
+  artifact volume falls below 20 GiB free; below 10 GiB it stops accepting
+  new trajectories, in-flight commits finish, and the manifest ends
+  `interrupted`. Resume normally after freeing space or moving
+  `$ENVFACTORY_MINI_ARTIFACT_ROOT` to a larger volume.
+- **Pilot circuit breaker** (plan §15): across the first 20 trajectory
+  attempts, if any single server's failure rate exceeds 20% the run fails
+  with a `circuit breaker` error naming the offending servers. Completed
+  artifacts are preserved; fix or quarantine the server, then resume —
+  fresh attempts restart the pilot window.
+
+If a dead process leaves `.synthesis.lock`, inspect it first and then explicitly add
 `--recover-stale-lock`. Never use that flag while the recorded PID is live.
 When compatibility or existing-run refusals block a deliberate restart, add
 `--new-run` to start a fresh suffixed run directory (plan §9 rule 6) instead of
