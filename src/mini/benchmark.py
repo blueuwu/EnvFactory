@@ -757,7 +757,12 @@ def render_serving_comparison_markdown(before: dict[str, Any], after: dict[str, 
         return f"| {metric} | {fmt.format(before[section][key])} | {fmt.format(after[section][key])} |"
 
     def summary_row(metric: str, key: str, fmt: str = "{}") -> str:
-        return row(metric, key, section="summary", fmt=fmt)
+        def cell(report: dict[str, Any]) -> str:
+            value = report["summary"][key]
+            # A fully failed sweep legitimately reports None latencies/tokens.
+            return "n/a" if value is None else fmt.format(value)
+
+        return f"| {metric} | {cell(before)} | {cell(after)} |"
 
     def top_row(metric: str, key: str) -> str:
         return f"| {metric} | {before[key]} | {after[key]} |"

@@ -401,3 +401,38 @@ def test_serving_comparison_renders_deltas_and_rejects_stage_mismatch():
     assert "-0.2000 seconds (-20.0%)" in rendered
     with pytest.raises(BenchmarkError, match="same stage"):
         render_serving_comparison_markdown(before, {"stage": "other"})
+
+
+def test_serving_comparison_tolerates_fully_failed_report():
+    """A sweep where every request failed reports None latencies; comparing
+    such a report (for example all prompts over an 8K context) must render
+    n/a cells instead of crashing on float formatting."""
+
+    def report(label):
+        return {
+            "stage": "serving_context",
+            "label": label,
+            "server": {
+                "served_model": "Qwen/Qwen3-14B",
+                "reported_max_model_len": 8192,
+                "configured_max_model_len": 8192,
+                "configured_max_num_seqs": 4,
+                "configured_gpu_memory_utilization": 0.85,
+            },
+            "inputs": {"source_run_id": "r", "requests": 20, "concurrency": 1},
+            "summary": {
+                "latency_seconds_p50": None,
+                "latency_seconds_p95": None,
+                "successful_requests": 0,
+                "failed_requests": 20,
+                "prompt_tokens_total": 0,
+                "completion_tokens_total": 0,
+            },
+        }
+
+    rendered = render_serving_comparison_markdown(
+        report("all-failed"), report("also-failed")
+    )
+    assert "| Latency p50 (s) | n/a | n/a |" in rendered
+    assert "| Latency p95 (s) | n/a | n/a |" in rendered
+    assert "Median-latency change: **n/a**." in rendered
