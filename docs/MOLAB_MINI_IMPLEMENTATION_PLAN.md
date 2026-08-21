@@ -29,7 +29,7 @@ The mini version must reuse the existing EnvFactory core. It must not become a d
 | 8. LoRA training | In progress | Local profile/render/checkpoint-integrity tests pass; MoLab smoke, resume, memory probe, and full training remain |
 | 9. Executable evaluation | In progress | Local executable-evaluation tests pass (strict tool-output parsing, fresh-state item execution, deterministic bootstrap metrics, source-linked reports, redaction) and the served-model identity probe guards the teacher boundary; live MoLab teacher/student report remains |
 | 10. Notebooks/runbook | In progress | Two ordered marimo notebooks, tested process supervision, and action-complete CLI runbook are implemented locally; clean-session MoLab reproduction remains |
-| 11. Performance hardening | In progress | Bounded-registration before/after report is complete; model, generation, and training tuning remain MoLab gates |
+| 11. Performance hardening | In progress | Bounded-registration before/after report complete; worker, serving-context, and comparison protocols documented with executable benchmark commands; live worker, vLLM tuning, 8K/16K context, and student-model sweeps remain MoLab gates |
 
 Update this table only after the corresponding phase exit criteria pass. Use `In progress`, `Blocked`, or `Complete`; if blocked, add the blocker and evidence immediately below the table.
 
