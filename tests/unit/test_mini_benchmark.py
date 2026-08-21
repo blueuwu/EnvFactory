@@ -453,3 +453,15 @@ def test_serving_comparison_tolerates_fully_failed_report():
     assert "| Latency p50 (s) | n/a | n/a |" in rendered
     assert "| Latency p95 (s) | n/a | n/a |" in rendered
     assert "Median-latency change: **n/a**." in rendered
+
+
+@pytest.mark.parametrize(
+    ("renderer", "stage_message"),
+    [
+        (render_generation_matrix_markdown, "not a generation worker matrix"),
+        (render_serving_context_markdown, "not a serving-context measurement"),
+    ],
+)
+def test_renderers_reject_wrong_stage_reports(renderer, stage_message):
+    with pytest.raises(BenchmarkError, match=stage_message):
+        renderer({"stage": "something_else", "label": "x"})
