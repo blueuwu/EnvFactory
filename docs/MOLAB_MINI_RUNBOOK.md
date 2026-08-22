@@ -949,10 +949,25 @@ any serving default.
 
 ### Student 4B versus 8B throughput and quality comparison
 
-No dedicated launcher exists for this comparison and none is needed: the
-training notebook/runbook already drives LlamaFactory, and
-`python -m src.mini.evaluate` already scores both students identically. The
-comparison is a protocol over those existing artifacts:
+The `training-comparison` benchmark stage turns this comparison into a single
+offline command once both student runs exist. It reads only recorded run
+artifacts (`training/training_summary.json`, the checkpoint's
+`trainer_state.json`, and `evaluation/student_metrics.json` when present), so
+it never needs a GPU or a live endpoint. Reports contain hashes, counts,
+loss bounds, `train_runtime`, `train_samples_per_second`, and the evaluation
+rate table - never prompts or scenario text:
+
+```bash
+# After training (and optionally evaluating) each student in its own run:
+python -m src.mini.benchmark training-comparison \
+  --config configs/mini/pipeline.toml \
+  --label qwen3-4b-vs-8b \
+  --baseline-run-id <run-4b-id> --candidate-run-id <run-8b-id> \
+  --output "$ENVFACTORY_MINI_ARTIFACT_ROOT/benchmarks/training-4b-vs-8b.json" \
+  --markdown-output "$ENVFACTORY_MINI_ARTIFACT_ROOT/benchmarks/training-4b-vs-8b.md"
+```
+
+The protocol that produces comparable artifacts is unchanged:
 
 1. Render and run the 20-step smoke job for `Qwen/Qwen3-4B`, then for
    `Qwen/Qwen3-8B`, each in its own run directory, with identical dataset,
@@ -965,7 +980,11 @@ comparison is a protocol over those existing artifacts:
    and maximum turns via `python -m src.mini.evaluate --model-role student`.
 4. Retain both `evaluation/report.md` files plus the raw training logs before
    selecting the default student. Decide on executable task success and
-   parse/valid-tool rates first; use throughput only to break ties.
+   parse/valid-tool rates first; use throughput only to break ties. The
+   `training-comparison` Markdown decision table renders exactly these
+   quantities from the retained artifacts.
 
 Do not compare runs that used different datasets, seeds, batch sizes, or
-LoRA targets; record every deviation in the decision log.
+LoRA targets; record every deviation in the decision log. The comparison
+command itself is offline and safe to run any time after both runs complete;
+the training and evaluation runs it compares remain MoLab GPU gates.

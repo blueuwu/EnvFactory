@@ -210,3 +210,28 @@ setup, so a call landing in a later wall-clock second skipped the collision
 and failed intermittently. The test now pins make_run_id via monkeypatch;
 verified stable across second boundaries (5/5) and in the full integration
 suite (24 passed).
+
+Addendum (2026-08-22): training-comparison benchmark instrument
+
+The remaining Phase 11 gate "Measure 4B versus 8B student training throughput
+and quality" had no executable instrument. `src.mini.benchmark` now has a
+`training-comparison` subcommand: it reads two completed runs' recorded
+artifacts offline (`training_summary.json`, checkpoint `trainer_state.json`,
+`evaluation/student_metrics.json` when present) and emits a redacted JSON
+report plus a Markdown decision table (global step, loss bounds,
+`train_runtime`, `train_samples_per_second`, adapter counts, dataset-manifest
+hash, and the six executable-evaluation rates with absolute deltas). Unsafe
+run IDs, identical run IDs, missing artifacts, and non-object payloads are
+rejected; training-only runs are supported with n/a evaluation columns. The
+instrument is fully offline - the two student training/evaluation runs it
+compares remain deferred MoLab GPU gates.
+
+Files changed: `src/mini/benchmark.py`, `tests/unit/test_mini_benchmark.py`,
+`docs/MOLAB_MINI_RUNBOOK.md`, `docs/MOLAB_MINI_IMPLEMENTATION_PLAN.md`.
+
+Verification: 28 focused benchmark unit tests pass (4 new: throughput/quality
+delta comparison with rendering, training-only comparison, bad-run-ID
+rejection, identical-run rejection); `ruff check` clean; end-to-end CLI smoke
+against synthetic run directories exercised the real artifact-reading path
+(exit 0, decision table rendered with correct deltas). Full-suite totals are
+recorded in the final handoff.

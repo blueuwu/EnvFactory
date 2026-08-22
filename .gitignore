@@ -48,6 +48,8 @@ secrets*.json
 /.ruff_cache/
 /.test-work/
 /models/
+/__marimo__/
+/examples/__marimo__/
 /.venv*/
 /venv/
 /huggingface/

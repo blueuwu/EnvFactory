@@ -29,7 +29,7 @@ The mini version must reuse the existing EnvFactory core. It must not become a d
 | 8. LoRA training | In progress | Local profile/render/checkpoint-integrity tests pass; MoLab smoke, resume, memory probe, and full training remain |
 | 9. Executable evaluation | In progress | Local executable-evaluation tests pass (strict tool-output parsing, fresh-state item execution, deterministic bootstrap metrics, source-linked reports, redaction) and the served-model identity probe guards the teacher boundary; live MoLab teacher/student report remains |
 | 10. Notebooks/runbook | In progress | Two ordered marimo notebooks, tested process supervision, and action-complete CLI runbook are implemented locally; clean-session MoLab reproduction remains |
-| 11. Performance hardening | In progress | Bounded-registration before/after report complete; worker, serving-context, and comparison protocols documented with executable benchmark commands; live worker, vLLM tuning, 8K/16K context, and student-model sweeps remain MoLab gates |
+| 11. Performance hardening | In progress | Bounded-registration before/after report complete; worker, serving-context, and training-comparison (4B vs 8B) instruments implemented with executable benchmark commands; live worker, vLLM tuning, 8K/16K context, and student-model sweeps remain MoLab gates |
 
 Update this table only after the corresponding phase exit criteria pass. Use `In progress`, `Blocked`, or `Complete`; if blocked, add the blocker and evidence immediately below the table.
 
@@ -985,6 +985,24 @@ peaks, and never prompt text. Focused regressions cover percentile ordering,
 redaction, failure-as-data recording, bounds, and comparison rendering; the
 full local suite passes (97 unit, 20 non-model integration). The live 8K/16K
 and `max_num_seqs` sweeps still require MoLab GPU sessions and remain open.
+
+Training-comparison instrument evidence (2026-08-22): the last Phase 11 gate
+without an executable instrument - "Measure 4B versus 8B student training
+throughput and quality" - now has one. `python -m src.mini.benchmark
+training-comparison` reads two completed runs' recorded artifacts offline
+(`training_summary.json`, checkpoint `trainer_state.json`, and
+`evaluation/student_metrics.json` when present) and emits a redacted JSON
+report plus a Markdown decision table covering global step, loss bounds,
+`train_runtime`, `train_samples_per_second`, adapter file counts, dataset
+manifest hash traceability, and all six executable-evaluation rates with
+absolute deltas. It rejects unsafe run IDs, identical baseline/candidate
+runs, missing artifacts, and non-object payloads; it works with training-only
+runs (evaluation columns render as n/a). Focused regressions cover throughput
+and quality deltas, evaluation-free comparisons, bad-input rejection, stage
+guards, and Markdown rendering; an end-to-end CLI smoke against synthetic run
+directories verified the real file-reading path. The instrument itself is
+offline; the two student training/evaluation runs it will compare remain
+MoLab GPU gates and stay deferred.
 
 ## 12. Canonical clean-session workflow
 
