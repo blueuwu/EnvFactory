@@ -1,10 +1,12 @@
 """Reproducible resource benchmarks for MoLab mini hardening work.
 
 The supported benchmarks measure fixed-catalog MCP registration,
-identical-seed generation worker sweeps, and live server configurations
+identical-seed generation worker sweeps, live server configurations
 replaying real completed-trajectory prompts (serving context, max_num_seqs,
-and GPU-utilization tuning).  Resulting JSON contains no prompts, scenario
-data, environment variables, or command-line secrets.
+and GPU-utilization tuning), and offline 4B-vs-8B student training/quality
+comparisons from recorded run artifacts (training comparison).  Resulting
+JSON contains no prompts, scenario data, environment variables, or
+command-line secrets.
 """
 
 from __future__ import annotations
@@ -911,6 +913,228 @@ def render_comparison_markdown(before: dict[str, Any], after: dict[str, Any]) ->
     )
 
 
+def _load_run_training_evidence(config: Any, run_id: str) -> dict[str, Any]:
+    """Collect offline training and evaluation evidence for one run.
+
+    Reads only immutable run artifacts (training summary, trainer state,
+    student evaluation metrics).  Prompt/scenario text is never present in
+    these artifacts, so nothing here can leak into a report.
+    """
+    from src.mini.synthesize import RunPaths
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        raise BenchmarkError("run ID contains unsafe characters")
+    root = RunPaths.for_run(config, run_id).root
+
+    def _load(path: Path, label: str) -> dict[str, Any]:
+        if not path.is_file():
+            raise BenchmarkError(f"run {run_id} is missing {label} ({path.name})")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BenchmarkError(
+                f"run {run_id} {label} is unreadable: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise BenchmarkError(f"run {run_id} {label} is not a JSON object")
+        return payload
+
+    training_root = root / "training"
+    summary = _load(training_root / "training_summary.json", "training summary")
+
+    latest_checkpoint = summary.get("latest_checkpoint")
+    trainer_state: dict[str, Any] = {}
+    if isinstance(latest_checkpoint, str) and latest_checkpoint:
+        checkpoint = Path(latest_checkpoint)
+        if not checkpoint.is_absolute():
+            checkpoint = config.artifact_root / "runs" / run_id / checkpoint.joinpath()
+        trainer_state = _load(checkpoint / "trainer_state.json", "trainer state")
+    else:
+        raise BenchmarkError(f"run {run_id} training summary has no latest_checkpoint")
+
+    log_history = trainer_state.get("log_history")
+    losses = [
+        float(record["loss"])
+        for record in log_history
+        if isinstance(record, dict)
+        and isinstance(record.get("loss"), (int, float))
+        and math.isfinite(float(record["loss"]))
+    ] if isinstance(log_history, list) else []
+
+    metrics_path = root / "evaluation" / "student_metrics.json"
+    student_metrics = (
+        _load(metrics_path, "student metrics") if metrics_path.is_file() else None
+    )
+
+    return {
+        "run_id": run_id,
+        "training_summary_sha256": _sha256(training_root / "training_summary.json"),
+        "global_step": summary.get("global_step"),
+        "minimum_loss": summary.get("minimum_loss"),
+        "maximum_loss": summary.get("maximum_loss"),
+        "finite_loss_records": summary.get("finite_loss_records"),
+        "adapter_files_count": len(summary.get("adapter_files") or []),
+        "dataset_manifest_sha256": summary.get("dataset_manifest_sha256"),
+        "trainer_runtime_seconds": trainer_state.get("train_runtime"),
+        "samples_per_second": trainer_state.get("train_samples_per_second"),
+        "loss_trend_first_last": (
+            {"first": losses[0], "last": losses[-1]} if losses else None
+        ),
+        "student_metrics_sha256": _sha256(metrics_path) if student_metrics else None,
+        "student_metrics": student_metrics,
+    }
+
+
+_RATE_NAMES = (
+    "structured_output_parse",
+    "valid_tool_name",
+    "valid_argument_schema",
+    "tool_call_execution_success",
+    "exact_tool_sequence",
+    "task_success",
+)
+
+
+def compare_training_runs(
+    config_path: str | Path,
+    *,
+    baseline_run_id: str,
+    candidate_run_id: str,
+    label: str,
+    repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compare 4B-versus-8B (or any two) student training runs offline.
+
+    Both runs must already have completed local training verification and,
+    optionally, executable student evaluation.  The comparison reads only the
+    recorded artifacts, so it is safe to run without a GPU.  Reports contain
+    hashes, counts, rates, and throughput - never prompts or scenario text.
+    """
+    if not _BENCHMARK_LABEL.fullmatch(label):
+        raise BenchmarkError(
+            "label must be 1-48 characters containing only letters, digits, dot, dash, or underscore"
+        )
+    if baseline_run_id == candidate_run_id:
+        raise BenchmarkError("baseline and candidate run IDs must differ")
+
+    config = load_config(config_path, repo_root=repo_root)
+    baseline = _load_run_training_evidence(config, baseline_run_id)
+    candidate = _load_run_training_evidence(config, candidate_run_id)
+
+    def rate_value(evidence: dict[str, Any], name: str) -> float | None:
+        metrics = evidence.get("student_metrics") or {}
+        rates = metrics.get("rates") or {}
+        rate = rates.get(name) or {}
+        value = rate.get("value")
+        return float(value) if isinstance(value, (int, float)) else None
+
+    comparisons: list[dict[str, Any]] = []
+    for name in _RATE_NAMES:
+        base = rate_value(baseline, name)
+        cand = rate_value(candidate, name)
+        comparisons.append(
+            {
+                "metric": name,
+                "baseline": base,
+                "candidate": cand,
+                "delta": (cand - base) if base is not None and cand is not None else None,
+            }
+        )
+
+    def scalar_delta(key: str) -> dict[str, Any]:
+        base = baseline.get(key)
+        cand = candidate.get(key)
+        delta = (
+            (cand - base)
+            if isinstance(base, (int, float))
+            and isinstance(cand, (int, float))
+            and not isinstance(base, bool)
+            and not isinstance(cand, bool)
+            else None
+        )
+        return {"metric": key, "baseline": base, "candidate": cand, "delta": delta}
+
+    for key in (
+        "global_step",
+        "minimum_loss",
+        "trainer_runtime_seconds",
+        "samples_per_second",
+    ):
+        comparisons.append(scalar_delta(key))
+
+    return {
+        "schema_version": 1,
+        "stage": "training_comparison",
+        "label": label,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "environment": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "logical_cpu_count": os.cpu_count(),
+        },
+        "inputs": {
+            "config_sha256": _sha256(config.config_path),
+            "baseline_run_id": baseline_run_id,
+            "candidate_run_id": candidate_run_id,
+            "baseline_training_summary_sha256": baseline["training_summary_sha256"],
+            "candidate_training_summary_sha256": candidate["training_summary_sha256"],
+            "baseline_student_metrics_sha256": baseline["student_metrics_sha256"],
+            "candidate_student_metrics_sha256": candidate["student_metrics_sha256"],
+        },
+        "runs": {
+            "baseline": baseline,
+            "candidate": candidate,
+        },
+        "comparisons": comparisons,
+    }
+
+
+def render_training_comparison_markdown(report: dict[str, Any]) -> str:
+    """Render the 4B-vs-8B decision table from one training-comparison report."""
+    if report.get("stage") != "training_comparison":
+        raise BenchmarkError("report is not a training comparison")
+    inputs = report["inputs"]
+    lines = [
+        "# MoLab mini training comparison",
+        "",
+        f"Baseline run: `{inputs['baseline_run_id']}` "
+        f"(summary sha256 `{inputs['baseline_training_summary_sha256'][:12]})`",
+        "",
+        f"Candidate run: `{inputs['candidate_run_id']}` "
+        f"(summary sha256 `{inputs['candidate_training_summary_sha256'][:12]})`",
+        "",
+        "| Metric | Baseline | Candidate | Delta |",
+        "|---|---:|---:|---:|",
+    ]
+
+    def cell(value: Any, fmt: str = "{}") -> str:
+        return "n/a" if value is None else fmt.format(value)
+
+    for item in report["comparisons"]:
+        metric = item["metric"]
+        if metric.endswith("_seconds") or metric == "minimum_loss":
+            fmt = "{:.4f}"
+        elif metric == "samples_per_second":
+            fmt = "{:.2f}"
+        else:
+            fmt = "{}"
+        lines.append(
+            f"| {metric} | {cell(item['baseline'], fmt)} | "
+            f"{cell(item['candidate'], fmt)} | {cell(item['delta'], fmt)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Quality deltas are absolute percentage-point differences in the recorded rates.",
+            "Choose a student size only after weighing throughput against executable quality;",
+            "the live MoLab gates (full training and served evaluation) remain deferred.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Measure MoLab mini performance stages")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -940,6 +1164,14 @@ def _build_parser() -> argparse.ArgumentParser:
     serving.add_argument("--output", required=True)
     serving.add_argument("--markdown-output")
     serving.add_argument("--repo-root")
+    training_compare = subparsers.add_parser("training-comparison")
+    training_compare.add_argument("--config", required=True)
+    training_compare.add_argument("--label", required=True)
+    training_compare.add_argument("--baseline-run-id", required=True)
+    training_compare.add_argument("--candidate-run-id", required=True)
+    training_compare.add_argument("--output", required=True)
+    training_compare.add_argument("--markdown-output")
+    training_compare.add_argument("--repo-root")
     compare = subparsers.add_parser("compare")
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
@@ -1006,11 +1238,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"serving-context report={destination}")
             return 0
+        if args.command == "training-comparison":
+            report = compare_training_runs(
+                args.config,
+                label=args.label,
+                baseline_run_id=args.baseline_run_id,
+                candidate_run_id=args.candidate_run_id,
+                repo_root=args.repo_root,
+            )
+            destination = Path(args.output).expanduser().resolve()
+            atomic_write_json(destination, report)
+            if args.markdown_output:
+                markdown_destination = Path(args.markdown_output).expanduser().resolve()
+                atomic_write_text(
+                    markdown_destination, render_training_comparison_markdown(report)
+                )
+                print(f"training comparison report={destination}; summary={markdown_destination}")
+            else:
+                print(f"training comparison report={destination}")
+            return 0
         before = json.loads(Path(args.before).read_text(encoding="utf-8"))
         after = json.loads(Path(args.after).read_text(encoding="utf-8"))
         destination = Path(args.output).expanduser().resolve()
         if before.get("stage") == "serving_context":
             rendered = render_serving_comparison_markdown(before, after)
+        elif before.get("stage") == "training_comparison":
+            raise BenchmarkError("compare requires two same-stage measurement reports; use training-comparison output directly")
         else:
             rendered = render_comparison_markdown(before, after)
         atomic_write_text(destination, rendered)
@@ -1031,10 +1284,12 @@ __all__ = [
     "benchmark_catalog_registration",
     "benchmark_generation_workers",
     "benchmark_serving_context",
+    "compare_training_runs",
     "main",
     "measure_operation",
     "render_comparison_markdown",
     "render_generation_matrix_markdown",
     "render_serving_comparison_markdown",
     "render_serving_context_markdown",
+    "render_training_comparison_markdown",
 ]

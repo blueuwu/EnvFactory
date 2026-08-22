@@ -15,11 +15,13 @@ from src.mini.benchmark import (
     _safe_error_message,
     benchmark_generation_workers,
     benchmark_serving_context,
+    compare_training_runs,
     measure_operation,
     render_comparison_markdown,
     render_generation_matrix_markdown,
     render_serving_comparison_markdown,
     render_serving_context_markdown,
+    render_training_comparison_markdown,
 )
 from src.mini.synthesize import RunPaths
 
@@ -460,8 +462,194 @@ def test_serving_comparison_tolerates_fully_failed_report():
     [
         (render_generation_matrix_markdown, "not a generation worker matrix"),
         (render_serving_context_markdown, "not a serving-context measurement"),
+        (render_training_comparison_markdown, "not a training comparison"),
     ],
 )
 def test_renderers_reject_wrong_stage_reports(renderer, stage_message):
     with pytest.raises(BenchmarkError, match=stage_message):
         renderer({"stage": "something_else", "label": "x"})
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: offline 4B-vs-8B training/quality comparison
+# ---------------------------------------------------------------------------
+
+
+def _write_trained_run(
+    tmp_path: Path,
+    run_id: str,
+    *,
+    global_step: int,
+    minimum_loss: float,
+    train_runtime: float,
+    samples_per_second: float,
+    student_rates: dict[str, float] | None,
+) -> str:
+    """Create a run directory with real training/evaluation artifact shapes."""
+    from src.mini.artifacts import atomic_write_json
+
+    run_root = tmp_path / "artifacts" / "runs" / run_id
+    training = run_root / "training"
+    checkpoint = training / "checkpoints" / f"checkpoint-{global_step}"
+    checkpoint.mkdir(parents=True)
+    atomic_write_json(
+        checkpoint / "trainer_state.json",
+        {
+            "global_step": global_step,
+            "train_runtime": train_runtime,
+            "train_samples_per_second": samples_per_second,
+            "log_history": [
+                {"loss": minimum_loss + 0.4, "step": 1},
+                {"loss": minimum_loss, "step": global_step},
+            ],
+        },
+    )
+    summary = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "latest_checkpoint": checkpoint.as_posix(),
+        "global_step": global_step,
+        "finite_loss_records": 2,
+        "minimum_loss": minimum_loss,
+        "maximum_loss": minimum_loss + 0.4,
+        "adapter_files": ["adapter_model.safetensors", "adapter_config.json"],
+        "dataset_manifest_sha256": "a" * 64,
+    }
+    atomic_write_json(training / "training_summary.json", summary)
+    if student_rates is not None:
+        atomic_write_json(
+            run_root / "evaluation" / "student_metrics.json",
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "rates": {
+                    name: {"numerator": 1, "denominator": 1, "value": value}
+                    for name, value in student_rates.items()
+                },
+            },
+        )
+    return run_id
+
+
+def test_training_comparison_reports_throughput_quality_and_renders(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ENVFACTORY_MINI_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    _write_trained_run(
+        tmp_path,
+        "bench-4b",
+        global_step=20,
+        minimum_loss=0.9,
+        train_runtime=100.0,
+        samples_per_second=8.0,
+        student_rates={"task_success": 0.70, "valid_tool_name": 0.97},
+    )
+    _write_trained_run(
+        tmp_path,
+        "bench-8b",
+        global_step=20,
+        minimum_loss=0.7,
+        train_runtime=180.0,
+        samples_per_second=4.5,
+        student_rates={"task_success": 0.82, "valid_tool_name": 0.99},
+    )
+
+    report = compare_training_runs(
+        CONFIG_PATH,
+        label="qwen3-4b-vs-8b",
+        baseline_run_id="bench-4b",
+        candidate_run_id="bench-8b",
+    )
+
+    assert report["stage"] == "training_comparison"
+    assert report["inputs"]["baseline_run_id"] == "bench-4b"
+    assert report["inputs"]["candidate_run_id"] == "bench-8b"
+    by_metric = {item["metric"]: item for item in report["comparisons"]}
+    assert by_metric["samples_per_second"] == {
+        "metric": "samples_per_second",
+        "baseline": 8.0,
+        "candidate": 4.5,
+        "delta": pytest.approx(-3.5),
+    }
+    assert by_metric["task_success"]["delta"] == pytest.approx(0.12, abs=1e-9)
+    assert by_metric["minimum_loss"]["delta"] == pytest.approx(-0.2, abs=1e-9)
+    assert report["runs"]["baseline"]["loss_trend_first_last"] == {
+        "first": 1.3,
+        "last": 0.9,
+    }
+    assert report["runs"]["baseline"]["student_metrics_sha256"] is not None
+
+    rendered = render_training_comparison_markdown(report)
+    assert "`bench-4b`" in rendered and "`bench-8b`" in rendered
+    assert "| samples_per_second | 8.00 | 4.50 | -3.50 |" in rendered
+    assert "remain deferred" in rendered
+
+
+def test_training_comparison_works_without_student_evaluation(tmp_path, monkeypatch):
+    monkeypatch.setenv("ENVFACTORY_MINI_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    _write_trained_run(
+        tmp_path,
+        "run-a",
+        global_step=5,
+        minimum_loss=1.1,
+        train_runtime=50.0,
+        samples_per_second=6.0,
+        student_rates=None,
+    )
+    _write_trained_run(
+        tmp_path,
+        "run-b",
+        global_step=5,
+        minimum_loss=1.0,
+        train_runtime=60.0,
+        samples_per_second=5.0,
+        student_rates=None,
+    )
+
+    report = compare_training_runs(
+        CONFIG_PATH,
+        label="train-only",
+        baseline_run_id="run-a",
+        candidate_run_id="run-b",
+    )
+    by_metric = {item["metric"]: item for item in report["comparisons"]}
+    assert by_metric["task_success"]["baseline"] is None
+    assert by_metric["task_success"]["delta"] is None
+    assert by_metric["trainer_runtime_seconds"]["delta"] == pytest.approx(10.0)
+    rendered = render_training_comparison_markdown(report)
+    assert "| task_success | n/a | n/a | n/a |" in rendered
+
+
+@pytest.mark.parametrize(
+    ("baseline", "candidate"),
+    [("bench-4b", "bench-4b"), ("missing-run", "bench-4b")],
+)
+def test_training_comparison_rejects_bad_run_ids(tmp_path, monkeypatch, baseline, candidate):
+    monkeypatch.setenv("ENVFACTORY_MINI_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    _write_trained_run(
+        tmp_path,
+        "bench-4b",
+        global_step=1,
+        minimum_loss=1.0,
+        train_runtime=1.0,
+        samples_per_second=1.0,
+        student_rates=None,
+    )
+    with pytest.raises(BenchmarkError):
+        compare_training_runs(
+            CONFIG_PATH,
+            label="bad-inputs",
+            baseline_run_id=baseline,
+            candidate_run_id=candidate,
+        )
+
+
+def test_training_comparison_rejects_identical_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("ENVFACTORY_MINI_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    with pytest.raises(BenchmarkError, match="must differ"):
+        compare_training_runs(
+            CONFIG_PATH,
+            label="same-run",
+            baseline_run_id="x",
+            candidate_run_id="x",
+        )
