@@ -575,18 +575,40 @@ class ToolGraph:
         visited = []
         queue = deque([start_node])
 
+        def can_append(tool: Tool) -> bool:
+            max_servers = getattr(sampler, "max_servers", None)
+            if max_servers is not None:
+                servers = {visited_tool.server for visited_tool in visited}
+                servers.add(tool.server)
+                if len(servers) > max_servers:
+                    return False
+            return self.validate_tool_chain(visited + [tool])
+
         while queue and len(visited) < max_nodes:
             current_node = queue.popleft()
+            if current_node in visited:
+                continue
 
             # Sample priors (dependencies)
             sampled_priors = sampler.sample_prior(
                 self, current_node, visited_nodes=visited, rng=rng
             )
             for prior in sampled_priors:
-                if prior not in visited:
+                if prior not in visited and can_append(prior):
                     visited.append(prior)
+                    if len(visited) >= max_nodes:
+                        break
+
+            if len(visited) >= max_nodes:
+                break
+
+            if not can_append(current_node):
+                continue
 
             visited.append(current_node)
+
+            if len(visited) >= max_nodes:
+                break
 
             # Sample neighbors
             sampled_neighbors = sampler.sample(
@@ -595,10 +617,13 @@ class ToolGraph:
 
             # Randomly sample another nodes in the same server
             if not sampled_neighbors:
-                next_node = rng.choice(
-                    self.server_to_tools[current_node.server]
-                )
-                queue.append(next_node)
+                same_server = [
+                    tool
+                    for tool in self.server_to_tools[current_node.server]
+                    if tool not in visited and tool not in queue
+                ]
+                if same_server:
+                    queue.append(rng.choice(same_server))
 
             for neighbor in sampled_neighbors:
                 queue.append(neighbor)

@@ -25,11 +25,13 @@ MOLAB_VLLM_VRAM_TOLERANCE_MIB="${MOLAB_VLLM_VRAM_TOLERANCE_MIB:-512}"
 MOLAB_VLLM_LORA_MODULE="${MOLAB_VLLM_LORA_MODULE:-}"
 MOLAB_VLLM_MAX_LORA_RANK="${MOLAB_VLLM_MAX_LORA_RANK:-64}"
 MOLAB_VLLM_EXPECTED_MODEL="${MOLAB_VLLM_EXPECTED_MODEL:-$MOLAB_VLLM_MODEL}"
+MOLAB_VLLM_USE_FLASHINFER_SAMPLER="${MOLAB_VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
 case "$MOLAB_VLLM_PORT" in (*[!0-9]*|'') echo "MOLAB_VLLM_PORT must be an integer" >&2; exit 2;; esac
 case "$MOLAB_VLLM_MAX_MODEL_LEN" in (*[!0-9]*|'') echo "MOLAB_VLLM_MAX_MODEL_LEN must be an integer" >&2; exit 2;; esac
 case "$MOLAB_VLLM_MAX_NUM_SEQS" in (*[!0-9]*|'') echo "MOLAB_VLLM_MAX_NUM_SEQS must be an integer" >&2; exit 2;; esac
 case "$MOLAB_VLLM_MAX_LORA_RANK" in (*[!0-9]*|'') echo "MOLAB_VLLM_MAX_LORA_RANK must be an integer" >&2; exit 2;; esac
+case "$MOLAB_VLLM_USE_FLASHINFER_SAMPLER" in (0|1) ;; (*) echo "MOLAB_VLLM_USE_FLASHINFER_SAMPLER must be 0 or 1" >&2; exit 2;; esac
 if [[ "$MOLAB_VLLM_GPU_MEMORY_UTILIZATION" != 0.* && "$MOLAB_VLLM_GPU_MEMORY_UTILIZATION" != 1.0 ]]; then
   echo "MOLAB_VLLM_GPU_MEMORY_UTILIZATION must be between 0 and 1" >&2
   exit 2
@@ -47,10 +49,12 @@ gpu_used_mib() {
 
 running_pid() {
   [[ -f "$PID_PATH" ]] || return 1
-  local pid
+  local pid status
   pid="$(<"$PID_PATH")"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
+  status="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ -n "$status" && "$status" != Z* ]] || return 1
   printf '%s\n' "$pid"
 }
 
@@ -80,6 +84,7 @@ case "$ACTION" in
     baseline="$(gpu_used_mib)"
     printf '%s\n' "$baseline" > "$BASELINE_PATH"
     export CUDA_VISIBLE_DEVICES=0
+    export VLLM_USE_FLASHINFER_SAMPLER="$MOLAB_VLLM_USE_FLASHINFER_SAMPLER"
     export ENVFACTORY_MINI_TEACHER_BASE_URL="http://127.0.0.1:${MOLAB_VLLM_PORT}/v1"
     extra_args=()
     if [[ -n "$MOLAB_VLLM_LORA_MODULE" ]]; then
@@ -107,7 +112,7 @@ case "$ACTION" in
       --max-model-len "$MOLAB_VLLM_MAX_MODEL_LEN" \
       --gpu-memory-utilization "$MOLAB_VLLM_GPU_MEMORY_UTILIZATION" \
       --max-num-seqs "$MOLAB_VLLM_MAX_NUM_SEQS" \
-      --disable-log-requests \
+      --no-enable-log-requests \
       "${extra_args[@]}" \
       >> "$LOG_PATH" 2>&1 &
     pid=$!

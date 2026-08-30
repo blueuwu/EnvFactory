@@ -242,6 +242,45 @@ def test_graph_sampling_is_reproducible_under_concurrency():
     assert process_samples[0] == process_samples[1] == list(samples[0])
 
 
+def test_graph_sampling_never_exceeds_max_nodes_with_many_priors():
+    tool_graph = _sampling_graph()
+    tools = list(tool_graph.server_to_tools["Weather"])
+
+    class BurstingSampler:
+        def sample_prior(self, graph, node, **kwargs):
+            return [tool for tool in tools if tool is not node]
+
+        def sample(self, graph, node, **kwargs):
+            return []
+
+    chain = tool_graph.sample(BurstingSampler(), max_nodes=3, seed=73)
+
+    assert len(chain.init_tool_chain) == 3
+    assert len(set(chain.init_tool_chain)) == 3
+
+
+def test_graph_sampling_applies_sampler_server_bound_to_priors():
+    tool_graph = _sampling_graph()
+    tools = list(tool_graph.server_to_tools["Weather"])
+    for index, tool in enumerate(tools):
+        tool.server = f"Server-{index}"
+
+    class ServerBoundBurstingSampler:
+        max_servers = 1
+
+        def sample_prior(self, graph, node, **kwargs):
+            return [tool for tool in tools if tool is not node]
+
+        def sample(self, graph, node, **kwargs):
+            return []
+
+    chain = tool_graph.sample(
+        ServerBoundBurstingSampler(), max_nodes=3, start_node=tools[0], seed=73
+    )
+
+    assert len({tool.server for tool in chain.init_tool_chain}) <= 1
+
+
 def test_missing_model_configuration_fails_before_network(monkeypatch):
     for name in (
         "OPENAI_MODEL",

@@ -55,6 +55,14 @@ class AlwaysUserProvided:
         return [True] * len(parameters)
 
 
+class NeverUserProvided(AlwaysUserProvided):
+    identity = "stable:test-never-user-provided"
+
+    def classify(self, parameters, param_to_tool_map=None):
+        self.calls += 1
+        return [False] * len(parameters)
+
+
 def _metadata() -> dict:
     return {
         "class_name": "Tiny",
@@ -175,6 +183,28 @@ def test_graph_manifest_and_warm_build_use_no_live_computation(tmp_path) -> None
     )
     assert warm.cached is True
     assert warm.manifest["output_sha256"] == result.manifest["output_sha256"]
+
+
+def test_required_orphan_inputs_are_patched_and_audited(tmp_path) -> None:
+    config, catalog = _config_and_catalog(tmp_path)
+    result = build_graph(
+        config,
+        catalog=catalog,
+        embedding_backend=StableEmbeddingBackend(),
+        user_classifier=NeverUserProvided(),
+    )
+
+    assert result.manifest["required_user_input_fallbacks"] == [
+        {"tool": "Tiny-first", "parameter": "query"},
+        {"tool": "Tiny-second", "parameter": "topic"},
+    ]
+    parameters = [node for node in result.graph.graph.nodes if isinstance(node, Parameter)]
+    required_inputs = {"query", "topic"}
+    assert all(
+        parameter.user_provided is True
+        for parameter in parameters
+        if parameter.name in required_inputs
+    )
 
 
 def test_main_records_graph_stage_events(tmp_path, monkeypatch) -> None:

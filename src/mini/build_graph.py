@@ -213,6 +213,19 @@ def _graph_counts(graph: ToolGraph) -> dict[str, int]:
     }
 
 
+def _patch_required_user_inputs(graph: ToolGraph) -> list[dict[str, str]]:
+    """Make required orphan inputs user-provided and return an audit record."""
+    patched: list[dict[str, str]] = []
+    for problem in graph.audit_and_patch_unfillable_parameters(auto_patch=False):
+        if not problem["is_required"]:
+            continue
+        parameter = problem["parameter"]
+        tool = problem["tool"]
+        parameter.set_user_provided(True)
+        patched.append({"tool": tool.name, "parameter": parameter.name})
+    return sorted(patched, key=lambda item: (item["tool"], item["parameter"]))
+
+
 def validate_graph(
     graph: ToolGraph,
     catalog: CatalogReport,
@@ -416,6 +429,7 @@ def build_graph(
         user_provided_classifier=cached_classifier,
         classify_user_provided=config.graph.classify_user_provided,
     )
+    required_user_input_fallbacks = _patch_required_user_inputs(graph)
     counts = validate_graph(graph, catalog, config)
     _atomic_save_graph(graph, config.graph.path)
     output_hash = _sha256_file(config.graph.path)
@@ -434,6 +448,7 @@ def build_graph(
         "classification_cache": None
         if cached_classifier is None
         else {"hits": cached_classifier.hits, "misses": cached_classifier.misses},
+        "required_user_input_fallbacks": required_user_input_fallbacks,
         "output_path": _manifest_path(config.graph.path, config.repo_root),
         "output_sha256": output_hash,
     }

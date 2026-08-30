@@ -556,7 +556,9 @@ def prepare_dataset(
         "zero_malformed_tool_call_json": True,
         "zero_seed_overlap": not bool(train_seeds.intersection(validation_seeds)),
         "fit_rate_at_least_95_percent": fit_rate >= 0.95,
-        "generation_yield_at_least_80_percent": yield_rate >= 0.80,
+        "generation_yield_meets_configured_minimum": (
+            yield_rate >= config.dataset.minimum_generation_yield
+        ),
         "server_share_at_most_35_percent_or_accepted": (
             not imbalanced or config.dataset.allow_server_imbalance
         ),
@@ -621,6 +623,7 @@ def prepare_dataset(
         },
         "quality": {
             "generation_yield": yield_rate,
+            "minimum_generation_yield": config.dataset.minimum_generation_yield,
             "pre_cutoff_fit_rate": fit_rate,
             "maximum_sequence_tokens": config.dataset.maximum_sequence_tokens,
             "minimum_tool_calls": config.dataset.minimum_tool_calls,

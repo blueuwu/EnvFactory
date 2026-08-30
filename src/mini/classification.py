@@ -58,6 +58,32 @@ def classification_prompt_hash(parameter: Parameter, tool: Tool | None) -> str:
     return hashlib.sha256(normalized).hexdigest()
 
 
+def _extract_classifications(parsed: object, batch: list[Parameter]) -> list[bool]:
+    """Accept the requested schema and unambiguous single-item fallback shapes."""
+    values: object | None = None
+    if isinstance(parsed, dict):
+        values = parsed.get("classifications")
+        if values is None and len(batch) == 1:
+            direct = parsed.get("can_directly_provide")
+            if type(direct) is bool:
+                values = [direct]
+            else:
+                nested = parsed.get(batch[0].name.strip())
+                if type(nested) is bool:
+                    values = [nested]
+                elif isinstance(nested, dict):
+                    nested_direct = nested.get("can_directly_provide")
+                    if type(nested_direct) is bool:
+                        values = [nested_direct]
+    if (
+        not isinstance(values, list)
+        or len(values) != len(batch)
+        or any(type(value) is not bool for value in values)
+    ):
+        raise ValueError("teacher returned invalid classifications")
+    return values
+
+
 class TeacherUserProvidedClassifier:
     """Classify parameters through an OpenAI-compatible local teacher endpoint."""
 
@@ -68,17 +94,21 @@ class TeacherUserProvidedClassifier:
         api_key: str,
         model: str,
         seed: int,
-        batch_size: int = 32,
+        batch_size: int = 1,
+        max_attempts: int = 3,
         client: object | None = None,
     ) -> None:
         if not base_url or not api_key or not model:
             raise ClassificationError("teacher classification requires base URL, API key, and model")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.seed = seed
         self.batch_size = batch_size
+        self.max_attempts = max_attempts
         self.__api_key = api_key
         self._client = client
 
@@ -88,6 +118,8 @@ class TeacherUserProvidedClassifier:
             "temperature": 0.0,
             "top_p": 1.0,
             "seed": self.seed,
+            "batch_size": self.batch_size,
+            "max_attempts": self.max_attempts,
             "thinking": False,
             "response_format": "json_schema",
             "max_tokens": 512,
@@ -154,30 +186,39 @@ class TeacherUserProvidedClassifier:
                     "additionalProperties": False,
                 },
             }
-            try:
-                response = self._get_client().chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    top_p=1.0,
-                    seed=self.seed,
-                    max_tokens=512,
-                    response_format={"type": "json_schema", "json_schema": schema},
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                )
-                content = response.choices[0].message.content
-                parsed = json.loads(content)
-                values = parsed["classifications"]
-            except Exception as exc:
+            last_error: Exception | None = None
+            for _attempt in range(self.max_attempts):
+                try:
+                    request_options: dict[str, Any] = {}
+                    if _attempt == 0:
+                        request_options["response_format"] = {
+                            "type": "json_schema",
+                            "json_schema": schema,
+                        }
+                    elif _attempt == 1:
+                        request_options["response_format"] = {"type": "json_object"}
+                    response = self._get_client().chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        top_p=1.0,
+                        seed=self.seed + _attempt,
+                        max_tokens=512,
+                        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                        **request_options,
+                    )
+                    content = response.choices[0].message.content
+                    parsed = json.loads(content)
+                    values = _extract_classifications(parsed, batch)
+                    break
+                except Exception as exc:
+                    last_error = exc
+            else:
+                assert last_error is not None
                 raise ClassificationError(
-                    f"teacher classification failed with {type(exc).__name__}"
-                ) from exc
-            if (
-                not isinstance(values, list)
-                or len(values) != len(batch)
-                or any(type(value) is not bool for value in values)
-            ):
-                raise ClassificationError("teacher returned an invalid classification array")
+                    "teacher classification failed after "
+                    f"{self.max_attempts} attempts with {type(last_error).__name__}"
+                ) from last_error
             results.extend(values)
         return results
 

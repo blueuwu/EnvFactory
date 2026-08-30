@@ -83,6 +83,8 @@ def test_teacher_uses_seed_json_schema_and_disables_thinking() -> None:
     assert classifier.classify([Parameter("title", "Event title", "string")]) == [True]
     assert captured["temperature"] == 0.0
     assert captured["seed"] == 73
+    assert classifier.settings["batch_size"] == 1
+    assert classifier.settings["max_attempts"] == 3
     assert captured["response_format"]["type"] == "json_schema"
     assert captured["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
 
@@ -113,4 +115,61 @@ def test_teacher_batches_independent_parameter_classifications() -> None:
     parameters = [Parameter(f"value_{index}", "User-provided value", "string") for index in range(5)]
 
     assert classifier.classify(parameters) == [True] * 5
+    assert classifier.settings["batch_size"] == 2
     assert batch_sizes == [2, 2, 1]
+
+
+def test_teacher_retries_malformed_structured_response() -> None:
+    calls = 0
+    seeds = []
+    response_formats = []
+
+    class Completions:
+        def create(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            seeds.append(kwargs["seed"])
+            response_formats.append(kwargs.get("response_format"))
+            content = (
+                "not-json"
+                if calls == 1
+                else json.dumps({"title": {"can_directly_provide": True}})
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    classifier = TeacherUserProvidedClassifier(
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="local-test-key",
+        model="teacher",
+        seed=73,
+        client=client,
+    )
+
+    assert classifier.classify([Parameter("title", "Event title", "string")]) == [True]
+    assert calls == 2
+    assert seeds == [73, 74]
+    assert response_formats[0]["type"] == "json_schema"
+    assert response_formats[1] == {"type": "json_object"}
+
+
+def test_teacher_accepts_unambiguous_parameter_key_fallback() -> None:
+    class Completions:
+        def create(self, **kwargs):
+            content = json.dumps({"items": False})
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    classifier = TeacherUserProvidedClassifier(
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="local-test-key",
+        model="teacher",
+        seed=73,
+        client=client,
+    )
+
+    assert classifier.classify([Parameter("items", "Returned collection", "array")]) == [False]

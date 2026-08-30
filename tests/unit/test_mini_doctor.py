@@ -177,10 +177,15 @@ def test_molab_dependency_profiles_and_launcher_are_isolated_and_safe() -> None:
     assert "set -euo pipefail" in launcher
     assert "--host 127.0.0.1" in launcher
     assert "--tensor-parallel-size 1" in launcher
+    assert "--no-enable-log-requests" in launcher
+    assert "--disable-log-requests" not in launcher
     assert "--api-key" not in launcher
     assert "CUDA_VISIBLE_DEVICES=0" in launcher
+    assert 'MOLAB_VLLM_USE_FLASHINFER_SAMPLER="${MOLAB_VLLM_USE_FLASHINFER_SAMPLER:-0}"' in launcher
+    assert 'export VLLM_USE_FLASHINFER_SAMPLER="$MOLAB_VLLM_USE_FLASHINFER_SAMPLER"' in launcher
     assert "model_server.log" in launcher
     assert "kill -TERM" in launcher
+    assert '"$status" != Z*' in launcher
     assert "memory returned" in launcher
     # vLLM reserves VLLM_PORT for internal networking; the API launcher uses
     # its own namespace and passes the value explicitly.

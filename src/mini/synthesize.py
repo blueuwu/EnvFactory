@@ -102,6 +102,35 @@ def deterministic_seeds(run_seed: int, target: int) -> list[int]:
     return random.Random(run_seed).sample(range(2**31), target)
 
 
+def deterministic_replacement_seeds(
+    run_seed: int, existing: Sequence[int], count: int
+) -> list[int]:
+    """Return stable, unique replacement seeds for exhausted trajectories.
+
+    The initial seed list is part of the persisted run contract, so extending a
+    run must not regenerate it with a larger ``random.sample`` call (whose
+    prefix is not guaranteed to remain unchanged). Replacement candidates are
+    instead derived independently from the run seed and the persisted list
+    length.
+    """
+    if count < 0:
+        raise ValueError("replacement seed count must not be negative")
+    occupied = set(existing)
+    replacements: list[int] = []
+    ordinal = len(existing)
+    while len(replacements) < count:
+        digest = hashlib.sha256(
+            f"{run_seed}:replacement:{ordinal}".encode("utf-8")
+        ).digest()
+        candidate = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+        ordinal += 1
+        if candidate in occupied:
+            continue
+        occupied.add(candidate)
+        replacements.append(candidate)
+    return replacements
+
+
 def _git_state(repo_root: Path) -> tuple[str | None, bool]:
     try:
         commit = subprocess.run(
@@ -205,6 +234,12 @@ def _safe_message(exc: BaseException, secret_values: Sequence[str] = ()) -> str:
 
 
 def _is_transient(exc: BaseException, stage: str) -> bool:
+    if (
+        stage == "validation"
+        and isinstance(exc, TrajectoryValidationError)
+        and str(exc) == "trajectory has no accepted node"
+    ):
+        return True
     if stage not in {"model", "transport", "timeout"}:
         return False
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
@@ -352,6 +387,11 @@ def validate_trajectory_payload(payload: dict[str, Any], allowed_tools: set[str]
         raise TrajectoryValidationError("completed trajectory has no accepted node")
     calls = 0
     for node_data in payload.get("nodes", []):
+        # Rejected branches are intentionally allowed to be incomplete.  Live
+        # validation applies these checks only to accepted nodes, so resume must
+        # use the same durable boundary.
+        if not isinstance(node_data, dict) or node_data.get("decision") is not True:
+            continue
         referenced = set(node_data.get("mcp_servers") or [])
         initial = node_data.get("initial_scenario")
         final = node_data.get("final_scenario")
@@ -392,6 +432,19 @@ def _failure_records(path: Path) -> list[dict[str, Any]]:
         return records if isinstance(records, list) else []
     except (OSError, json.JSONDecodeError):
         return []
+
+
+def _failure_record_retryable(record: object) -> bool:
+    """Honor current retry policy for records written by older code too."""
+    if not isinstance(record, dict):
+        return False
+    if record.get("retryable") is True:
+        return True
+    return (
+        record.get("stage") == "validation"
+        and record.get("exception_class") == "TrajectoryValidationError"
+        and record.get("safe_message") == "trajectory has no accepted node"
+    )
 
 
 def _record_failure(
@@ -480,7 +533,7 @@ def _reconcile_completed(
         attempts = manifest.attempts_by_seed.get(str(seed), 0)
         can_retry = bool(
             latest
-            and latest.get("retryable") is True
+            and _failure_record_retryable(latest)
             and attempts < manifest.target_trajectories  # tightened by caller below
         )
         if latest and not can_retry:
@@ -718,7 +771,7 @@ async def synthesize(
                 latest = records[-1] if records else None
                 attempts = manifest.attempts_by_seed.get(str(seed), 0)
                 if latest and (
-                    latest.get("retryable") is not True
+                    not _failure_record_retryable(latest)
                     or attempts >= config.generation.max_attempts_per_seed
                 ):
                     failed.append(seed)
@@ -726,6 +779,23 @@ async def synthesize(
                     pending.append(seed)
             manifest.failed_seeds = failed
             manifest.pending_seeds = pending
+            # A run starts with exactly ``target`` seeds. Once any seed reaches
+            # its retry ceiling, a resume would otherwise have no pending work
+            # and could never reach the requested number of valid trajectories.
+            # Extend the durable seed list only far enough to replace exhausted
+            # seeds; subsequent resumes repeat the same deterministic process.
+            needed = target - len(manifest.completed_seeds)
+            if len(manifest.pending_seeds) < needed:
+                replacements = deterministic_replacement_seeds(
+                    config.run_seed,
+                    manifest.seeds,
+                    needed - len(manifest.pending_seeds),
+                )
+                manifest.seeds.extend(replacements)
+                manifest.pending_seeds.extend(replacements)
+                manifest.attempts_by_seed.update(
+                    {str(seed): 0 for seed in replacements}
+                )
         else:
             commit, dirty = _git_state(config.repo_root)
             seeds = deterministic_seeds(config.run_seed, target)

@@ -19,4 +19,4 @@ vllm serve "$VLLM_MODEL" \
   --max-model-len 65536 \
   --dtype bfloat16 \
   --trust-remote-code \
-  --disable-log-requests
+  --no-enable-log-requests

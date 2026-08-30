@@ -119,6 +119,7 @@ class DatasetConfig(_StrictModel):
     maximum_sequence_tokens: int = Field(gt=0)
     tokenizer_model: str = "Qwen/Qwen3-8B"
     tokenizer_revision: str | None = None
+    minimum_generation_yield: float = Field(default=0.80, ge=0, le=1)
     allow_server_imbalance: bool = False
 
     @field_validator("tokenizer_model")

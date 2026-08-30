@@ -28,6 +28,7 @@ def test_load_config_is_strict_typed_and_repository_relative(tmp_path: Path, mon
     assert config.schema_version == 1
     assert config.generation.workers == 4
     assert config.dataset.train_ratio == pytest.approx(0.9)
+    assert config.dataset.minimum_generation_yield == pytest.approx(0.8)
     assert config.artifact_root == REPOSITORY_ROOT / "artifacts" / "mini"
     assert config.catalog.mcp_config == REPOSITORY_ROOT / "configs" / "mini" / "mcp_server.json"
     assert config.graph.embedding_cache == REPOSITORY_ROOT / "artifacts" / "mini" / "cache" / "embeddings.sqlite3"

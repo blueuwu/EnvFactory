@@ -58,6 +58,7 @@ minimum_tool_calls = 1
 maximum_sequence_tokens = 8192
 tokenizer_model = "Qwen/Qwen3-8B"
 tokenizer_revision = "main"
+minimum_generation_yield = 0.80
 allow_server_imbalance = false
 
 [evaluation]

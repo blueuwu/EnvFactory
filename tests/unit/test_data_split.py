@@ -277,3 +277,31 @@ def test_server_imbalance_requires_an_explicit_configured_acceptance(tmp_path) -
     assert result.manifest["quality"]["imbalanced_servers"] == {"Calculator": 1.0}
     assert result.manifest["quality"]["server_imbalance_accepted"] is True
     assert result.manifest["gates"]["server_share_at_most_35_percent_or_accepted"] is True
+
+
+def test_generation_yield_threshold_requires_an_explicit_configured_acceptance(
+    tmp_path,
+) -> None:
+    config, catalog, run_id = _run_fixture(tmp_path)
+    manifest_path = config.artifact_root / "runs" / run_id / "run_manifest.json"
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    value["seeds"].extend([31, 37])
+    value["failed_seeds"].extend([31, 37])
+    value["attempts_by_seed"].update({"31": 3, "37": 3})
+    manifest_path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(
+        DatasetGateError, match="generation_yield_meets_configured_minimum"
+    ):
+        prepare_dataset(config, run_id, tokenizer=FakeTokenizer(), catalog=catalog)
+
+    smoke_dataset = config.dataset.model_copy(
+        update={"minimum_generation_yield": 0.70}
+    )
+    smoke_config = config.model_copy(update={"dataset": smoke_dataset})
+    result = prepare_dataset(
+        smoke_config, run_id, tokenizer=FakeTokenizer(), catalog=catalog
+    )
+    assert result.manifest["quality"]["generation_yield"] == pytest.approx(0.75)
+    assert result.manifest["quality"]["minimum_generation_yield"] == pytest.approx(0.70)
+    assert result.manifest["gates"]["generation_yield_meets_configured_minimum"] is True
